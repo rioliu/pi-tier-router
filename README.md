@@ -28,6 +28,14 @@ first user message
 pi install npm:pi-tier-router
 ```
 
+Or straight from GitHub while the npm package is pending:
+
+```bash
+pi install git:github.com/rioliu/pi-tier-router
+```
+
+Install **one or the other**. Loading both silently breaks the wizard: `/auto-router` stops dispatching and the literal text is sent to the model instead.
+
 Then select it: `/model` → `router/auto`, and press `Ctrl+S` to make it the default for new sessions. Or set it directly in `settings.json`:
 
 ```json
