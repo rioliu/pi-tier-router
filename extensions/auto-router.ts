@@ -168,6 +168,27 @@ function readRoles(): { flash: Role; pro: Role } {
 	};
 }
 
+/**
+ * Move an older <agent-dir>/extensions config next to the extension file as
+ * soon as this extension loads, so that uninstalling the extension leaves
+ * nothing behind. Idempotent; for a file install both paths are the same file,
+ * so there is nothing to move. Exported for tests.
+ */
+export function migrateLegacyConfig(): string | undefined {
+	const legacy = legacyConfigFile();
+	if (!existsSync(legacy)) return undefined;
+	const target = configFile();
+	if (samePath(legacy, target)) return undefined;
+	mkdirSync(configDir(), { recursive: true });
+	if (!existsSync(target)) writeFileSync(target, readFileSync(legacy, "utf8"));
+	rmSync(legacy);
+	debugRating(`config ready at ${target}`);
+	return target;
+}
+
+// Migrate before the roles are read, so the moved config is the one in effect.
+migrateLegacyConfig();
+
 /** Roles are re-read at session and prompt boundaries, so editing the config
  * changes routing behavior without restarting Pi. */
 let ROLES = readRoles();

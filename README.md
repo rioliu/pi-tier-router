@@ -73,8 +73,8 @@ extension takes its config with it:
 | `pi install git:` | `~/.pi/agent/git/github.com/rioliu/pi-tier-router/extensions/auto-router.json` |
 
 `pi update` preserves the file — verified for both npm and git sources. If an older copy is
-sitting in `~/.pi/agent/extensions/`, it is still read, and the next `/auto-router` save writes
-the new location and removes it.
+sitting in `~/.pi/agent/extensions/`, it is read and **moved next to the extension the first time
+it loads**, so uninstalling leaves nothing behind.
 
 ```json
 {

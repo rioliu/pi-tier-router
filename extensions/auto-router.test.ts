@@ -165,6 +165,21 @@ async function run() {
 	assert.equal(calls.length, 1, "and it is the legacy roles that get resolved");
 	assert.equal(calls[0][1], "error", "default is router/auto, so a pair that cannot resolve is an error");
 
+	// load-time migration moves that older copy next to the code, so an
+	// uninstall takes the config with it even if the wizard never ran
+	const moved = pkgMod.migrateLegacyConfig();
+	assert.ok(moved, "migration reports the new location");
+	assert.equal(
+		realpathSync(moved),
+		realpathSync(path.join(PKG_EXTENSIONS, "auto-router.json")),
+		"legacy config moved next to the extension file",
+	);
+	assert.ok(!existsSync(CONFIG), "and the old copy is gone");
+	assert.deepEqual(JSON.parse(readFileSync(path.join(PKG_EXTENSIONS, "auto-router.json"), "utf8")), {
+		"flash-model": "provL/flashL",
+		"pro-model": "provL/proL",
+	}, "the moved config keeps its contents");
+
 	// chooseRating chain ------------------------------------------------------
 	let counter = { self: 0, jev: 0 };
 	const reset = () => (counter = { self: 0, jev: 0 });
