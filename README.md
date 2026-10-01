@@ -1,11 +1,17 @@
+<p align="center">
+  <img src="https://rioliu.github.io/pi-tier-router/logo.svg" width="96" height="96" alt="pi-tier-router logo">
+</p>
+
 # pi-tier-router
 
 [![npm](https://img.shields.io/npm/v/pi-tier-router.svg)](https://www.npmjs.com/package/pi-tier-router)
-[![npm downloads](https://img.shields.io/npm/dm/pi-tier-router.svg)](https://www.npmjs.com/package/pi-tier-router)
+[![repo size](https://img.shields.io/github/repo-size/rioliu/pi-tier-router.svg)](https://github.com/rioliu/pi-tier-router)
 [![License: MIT](https://img.shields.io/github/license/rioliu/pi-tier-router)](LICENSE)
 [![Pi extension](https://img.shields.io/badge/Pi-extension-6c5ce7)](https://github.com/earendil-works/pi)
 
 > **Pay for difficulty, not for every message.** Routine work runs on the cheap model; only genuinely hard issues escalate to the strong one.
+
+**Project page:** [rioliu.github.io/pi-tier-router](https://rioliu.github.io/pi-tier-router/)
 
 Route a Pi coding session between a **cheap flash model** and a **strong pro model**, based on how hard the issue actually is.
 
