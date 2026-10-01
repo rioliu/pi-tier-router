@@ -283,6 +283,13 @@ async function run() {
 		["add a button to the header", undefined],
 		["", undefined],
 		["fix the race condition in the task queue right now, or is this just a typo in the comment?", undefined],
+		// Chinese: same table, no \b anchors, full-width ？ counts as a question
+		["这个死锁很难复现，帮我排查一下", "pro", "cn-concurrency"],
+		["把文档里的错别字改一下", "flash", "cn-small-edit"],
+		["你好", "flash", "cn-trivial"],
+		// a "what is ..." question is an explanation: flash wins over the hard topic
+		["什么是竞态条件？", "flash", "cn-lookup"],
+		["修复一下，现在还是有报错", undefined], // medium: abstain, chain decides
 	];
 	for (const [prompt, expected, signal] of localCases) {
 		const decision = decideLocally(prompt);

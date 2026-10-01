@@ -38,7 +38,9 @@ prompt arrives (before_agent_start)
 - **One prompt, one decision** — the next prompt re-decides, so a hard task can escalate without
   locking the whole session to pro.
 - **Local first**: routine and obviously hard prompts never reach a model. `/auto-router status`
-  reports how often the local layer decided on its own.
+  reports how often the local layer decided on its own. Signals cover **English and Chinese**
+  (stack traces are language-neutral), and the scan looks at the first 32 KB only — a 1 MB paste
+  still decides in ~0.3 ms, and past the window the layer abstains rather than guess.
 - **Jev is optional**, never a dependency — consulted only when the local layer abstains *and* the
   flash model is unsure.
 - **Compaction summaries** always run on the flash model.

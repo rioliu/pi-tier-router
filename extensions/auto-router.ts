@@ -344,6 +344,44 @@ const LOCAL_SIGNALS: LocalSignal[] = [
 		weight: 2,
 		re: /\b(across (?:all|the) (?:files|modules|services|repos)|whole (?:codebase|project)|end[- ]to[- ]end|all (?:of )?the (?:files|modules|repos))\b/i,
 	},
+	// Chinese signals: no \b here - Chinese has no word boundaries, so the
+	// English-style anchors above would never match CJK text.
+	{
+		name: "cn-concurrency",
+		side: "pro",
+		weight: 3,
+		re: /竞态|死锁|线程安全|并发问题|内存泄漏|数据竞争|原子性|双重释放|释放后使用/,
+	},
+	{
+		name: "cn-architecture",
+		side: "pro",
+		weight: 3,
+		re: /架构|重构|迁移|向后兼容|兼容性|破坏性变更|解耦|跨(?:服务|模块|系统|文件)/,
+	},
+	{
+		name: "cn-security",
+		side: "pro",
+		weight: 3,
+		re: /安全漏洞|漏洞|注入|加密|鉴权|越权|CVE-\d{4}-\d+/,
+	},
+	{
+		name: "cn-debug",
+		side: "pro",
+		weight: 2,
+		re: /报错|崩溃|异常|堆栈|栈溢出|排查|定位问题|根因|不生效|不工作|失败|复现/,
+	},
+	{
+		name: "cn-performance",
+		side: "pro",
+		weight: 2,
+		re: /性能|延迟|瓶颈|优化|内存占用|吞吐/,
+	},
+	{
+		name: "cn-wide-scope",
+		side: "pro",
+		weight: 2,
+		re: /所有(?:文件|模块|服务|仓库)|全部(?:文件|模块)|端到端|整个(?:代码库|项目)/,
+	},
 	// flash: work a fast model handles reliably (must total >= 2 to decide).
 	{
 		name: "trivial",
@@ -363,21 +401,50 @@ const LOCAL_SIGNALS: LocalSignal[] = [
 		weight: 2,
 		re: /\b(?:typo|comments?|readme|docs?|documentation|whitespace|indent(?:ation)?|cosmetic|rename|spelling|grammar|format(?:ting)?)\b/i,
 	},
+	{
+		name: "cn-trivial",
+		side: "flash",
+		weight: 3,
+		re: /^(?:你好|您好|哈喽|嗨|谢谢|感谢|多谢|好的|收到|继续|可以|嗯|辛苦了|没问题)[!！。.~\s]*$/,
+	},
+	{
+		name: "cn-lookup",
+		side: "flash",
+		weight: 2,
+		re: /什么是|是什么|在哪|哪里|怎么用|如何使用|解释(?:一下)?|说明一下|列出|查看|总结|哪一?个|读一下|帮我看/,
+	},
+	{
+		name: "cn-small-edit",
+		side: "flash",
+		weight: 2,
+		re: /错别字|注释|文档|说明文档|重命名|拼写|格式|排版|笔误/,
+	},
 ];
 
 function localConfidence(margin: number): number {
 	return Math.min(0.97, 0.85 + 0.04 * margin);
 }
 
+/**
+ * How much of the prompt the local layer looks at. One bounded slice keeps the
+ * worst case flat no matter how much someone pastes; signals live at the head
+ * (the request, a pasted trace), and past the window the layer abstains, which
+ * is always safe.
+ */
+const MAX_SCAN_CHARS = 32_000;
+
 /** Decide from the prompt alone; undefined means "abstain, ask the flash model". */
 export function decideLocally(prompt: string): LocalDecision | undefined {
-	if (!prompt.trim()) return undefined;
+	if (!prompt.length) return undefined;
+	// One bounded copy, reused by every signal below. No trim(): it would copy
+	// the whole paste just to check whether there is content.
+	const text = prompt.length > MAX_SCAN_CHARS ? prompt.slice(0, MAX_SCAN_CHARS) : prompt;
 	let proScore = 0;
 	let flashScore = 0;
 	const pro: string[] = [];
 	const flash: string[] = [];
 	for (const signal of LOCAL_SIGNALS) {
-		if (!signal.re.test(prompt)) continue;
+		if (!signal.re.test(text)) continue;
 		if (signal.side === "pro") {
 			proScore += signal.weight;
 			pro.push(signal.name);
@@ -386,12 +453,18 @@ export function decideLocally(prompt: string): LocalDecision | undefined {
 			flash.push(signal.name);
 		}
 	}
-	// Structural features that are about shape rather than wording.
-	if ((prompt.match(/```/g)?.length ?? 0) >= 4 && prompt.length >= 1_000) {
+	// Structural features, counted with early exits instead of full scans.
+	let fences = 0;
+	for (let i = text.indexOf("```"); i !== -1 && fences < 4; i = text.indexOf("```", i + 3)) fences++;
+	if (fences >= 4 && prompt.length >= 1_000) {
 		proScore += 1;
 		pro.push("big-context");
 	}
-	if (new Set(prompt.match(/[\w./-]+\.[A-Za-z]{1,6}\b/g) ?? []).size >= 3) {
+	// Declared per call: /g state (lastIndex) must never leak between prompts.
+	const fileRe = /[\w./-]+\.[A-Za-z]{1,6}\b/g;
+	const files = new Set<string>();
+	for (let match = fileRe.exec(text); match && files.size < 3; match = fileRe.exec(text)) files.add(match[0]);
+	if (files.size >= 3) {
 		proScore += 1;
 		pro.push("multi-file");
 	}
@@ -399,7 +472,8 @@ export function decideLocally(prompt: string): LocalDecision | undefined {
 		flashScore += 1;
 		flash.push("short");
 	}
-	if (prompt.length < 400 && prompt.includes("?")) {
+	// Full-width ? counts too: Chinese questions use it.
+	if (prompt.length < 400 && (text.includes("?") || text.includes("？"))) {
 		flashScore += 1;
 		flash.push("question");
 	}
