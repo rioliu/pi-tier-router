@@ -173,6 +173,35 @@ agreement gate), config persistence and refresh, change warnings, and the `provi
 parser. It runs against a temporary copy of the extension, so it never writes into your real Pi
 directory.
 
+## References
+
+The routing logic in this extension is built on the papers below, selected from the
+[Awesome-Routing-LLMs](https://github.com/MilkThink-Lab/Awesome-Routing-LLMs) survey — each one
+directly shapes a layer of the `local -> flash rating -> Jev` chain. The full analysis is in
+[docs/local-router-research.md](docs/local-router-research.md).
+
+**Local feature routing (layer 0)**
+
+1. I. Ong, A. Almahairi, V. Wu, et al., "RouteLLM: Learning to Route LLMs with Preference Data," *ICLR 2024*. [arXiv:2406.18665](https://arxiv.org/abs/2406.18665)
+2. C. Tran, S. Paracha, A. Hafeez, S. Chen, "Arch-Router: Aligning LLM Routing with Human Preferences," *ArXiv 2025*. [arXiv:2506.16655](https://arxiv.org/abs/2506.16655)
+3. S. N. Hari, M. Thomson, "Tryage: Real-time, Intelligent Routing of User Prompts to Large Language Models," *ArXiv 2023*. [arXiv:2308.11601](https://arxiv.org/abs/2308.11601)
+
+**Confidence-gated two-tier escalation (flash self-rating, abstain band)**
+
+4. G. Ramírez, A. Birch, I. Titov, "Optimising Calls to Large Language Models with Uncertainty-Based Two-Tier Selection," *COLM 2024*. [arXiv:2405.02134](https://arxiv.org/abs/2405.02134)
+5. Y.-N. Chuang et al., "Confident or Seek Stronger: Exploring Uncertainty-Based On-Device LLM Routing from Benchmarking to Generalization," *NeurIPS 2025 Workshop*. [arXiv:2502.04428](https://arxiv.org/abs/2502.04428)
+6. P. Aggarwal et al., "AutoMix: Automatically Mixing Language Models," *NeurIPS 2024*. [arXiv:2310.12963](https://arxiv.org/abs/2310.12963)
+
+**Memory-based routing (decision store, kNN reuse)**
+
+7. Y. Li, "Rethinking Predictive Modeling for LLM Routing: When Simple kNN Beats Complex Learned Routers," *ArXiv 2025*. [arXiv:2505.12601](https://arxiv.org/abs/2505.12601)
+8. Z. Zhao, S. Jin, Z. M. Mao, "Eagle: Efficient Training-Free Router for Multi-LLM Inference," *NeurIPS 2024 Workshop*. [arXiv:2409.15518](https://arxiv.org/abs/2409.15518)
+
+**Benchmarks (coverage/risk measurement)**
+
+9. Q. J. Hu et al., "RouterBench: A Benchmark for Multi-LLM Routing System," *ICML 2024 Workshop*. [arXiv:2403.12031](https://arxiv.org/abs/2403.12031)
+10. Z. Huang et al., "RouterEval: A Comprehensive Benchmark for Routing LLMs to Explore Model-level Scaling Up in LLMs," *EMNLP 2025*. [arXiv:2503.10657](https://arxiv.org/abs/2503.10657)
+
 ## License
 
 MIT
