@@ -20,6 +20,15 @@ const { chooseRating, parseRole, parseSelfRating, checkConfig, writeOwnConfig } 
 	pathToFileURL(COPY).href
 );
 
+// Package installs live under Pi's managed git/npm directories; their config
+// must fall back to <agent-dir>/extensions instead of being written into a
+// tree that `pi update` can replace.
+const PKG_EXTENSIONS = path.join(root, "git", "github.com", "rioliu", "pi-tier-router", "extensions");
+mkdirSync(PKG_EXTENSIONS, { recursive: true });
+const PKG_COPY = path.join(PKG_EXTENSIONS, "auto-router.ts");
+copyFileSync(COPY, PKG_COPY);
+const pkgMod = await import(pathToFileURL(PKG_COPY).href);
+
 const CONFIG = path.join(root, "extensions", "auto-router.json");
 const FALLBACK = { provider: "cc-switch-xiaomi-mi-mo-token-plan-china", id: "mimo-v2.6-flash" };
 const MIMO = FALLBACK.provider;
@@ -119,11 +128,23 @@ async function run() {
 	checkConfig(ctx);
 	assert.equal(calls.length, 1, "stale pair reported after the roles changed");
 	assert.equal(calls[0][1], "warning");
-	// and pi's settings were never written
+	// pi's settings were never written
 	assert.deepEqual(JSON.parse(readFileSync(path.join(root, "settings.json"), "utf8")), {
 		defaultProvider: "mimo-v2.6-flash",
 		defaultModel: "mimo-v2.6-flash",
 	});
+
+	// a package install writes to the same stable location, never into the clone
+	const pkgWritten = pkgMod.writeOwnConfig("provC/flashC", "provC/proC");
+	assert.equal(
+		realpathSync(pkgWritten),
+		realpathSync(path.join(root, "extensions", "auto-router.json")),
+		"package installs keep config in <agent-dir>/extensions",
+	);
+	assert.ok(
+		!pkgWritten.includes(`${path.sep}git${path.sep}`),
+		"config must not be written inside the cloned package tree",
+	);
 
 	// chooseRating chain ------------------------------------------------------
 	let counter = { self: 0, jev: 0 };

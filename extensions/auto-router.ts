@@ -34,7 +34,7 @@
  * Select with /model -> router/auto; Ctrl+S saves it as the default.
  */
 
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -108,13 +108,33 @@ const EXTENSION_DIR = ((): string | undefined => {
 
 /**
  * Where the config lives: next to the extension file, so it is removed with
- * it. A package install runs from Pi's npm directory, which Pi may replace
- * wholesale on `pi update` - config stored there would be lost - so that case
- * falls back to the user's extensions directory: stable across updates, and
- * still not Pi's own settings pocket.
+ * it. Package installs (npm and git sources) are copied into Pi's managed
+ * directories, which `pi update` may replace wholesale - config stored there
+ * would be lost - so those fall back to the user's extensions directory:
+ * stable across updates, and still not Pi's own settings pocket.
  */
+function realPath(target: string): string {
+	try {
+		return realpathSync(target);
+	} catch {
+		// Parent may not exist yet; compare the literal path.
+		return target;
+	}
+}
+
+function isManagedInstall(dir: string): boolean {
+	if (dir.includes(`${path.sep}node_modules${path.sep}`)) return true;
+	// Compare real paths: import.meta.url is a realpath, and the agent dir may
+	// sit behind a symlink (e.g. macOS /var -> /private/var).
+	const realDir = realPath(dir);
+	return ["npm", "git"].some((name) => {
+		const managed = realPath(path.join(agentDir(), name));
+		return realDir === managed || realDir.startsWith(`${managed}${path.sep}`);
+	});
+}
+
 function configDir(): string {
-	if (EXTENSION_DIR && !EXTENSION_DIR.includes(`${path.sep}node_modules${path.sep}`)) return EXTENSION_DIR;
+	if (EXTENSION_DIR && !isManagedInstall(EXTENSION_DIR)) return EXTENSION_DIR;
 	return path.join(agentDir(), "extensions");
 }
 
