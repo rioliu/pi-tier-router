@@ -1,5 +1,5 @@
 import assert from "node:assert";
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -134,17 +134,36 @@ async function run() {
 		defaultModel: "mimo-v2.6-flash",
 	});
 
-	// a package install writes to the same stable location, never into the clone
+	// a package install keeps its config next to its own code, so uninstalling
+	// the extension takes the config with it
 	const pkgWritten = pkgMod.writeOwnConfig("provC/flashC", "provC/proC");
 	assert.equal(
 		realpathSync(pkgWritten),
-		realpathSync(path.join(root, "extensions", "auto-router.json")),
-		"package installs keep config in <agent-dir>/extensions",
+		realpathSync(path.join(PKG_EXTENSIONS, "auto-router.json")),
+		"package installs keep config next to the extension file",
 	);
 	assert.ok(
-		!pkgWritten.includes(`${path.sep}git${path.sep}`),
-		"config must not be written inside the cloned package tree",
+		pkgWritten.includes(`${path.sep}git${path.sep}`),
+		"config lives inside the package directory",
 	);
+	assert.ok(!existsSync(CONFIG), "an older <agent-dir>/extensions copy is superseded, not stranded");
+
+	// ...and when only that older copy exists, the package install still reads it
+	// (restore the default first so no unrelated default-change info muddies this)
+	rmSync(path.join(PKG_EXTENSIONS, "auto-router.json"), { force: true });
+	writeSettings({ defaultProvider: "router", defaultModel: "auto" });
+	writeFileSync(CONFIG, JSON.stringify({ "flash-model": "provL/flashL", "pro-model": "provL/proL" }));
+	const provLPair = registry([
+		{ provider: "provL", id: "flashL" },
+		{ provider: "provL", id: "proL" },
+	]);
+	({ calls, ctx } = collector(provLPair));
+	pkgMod.checkConfig(ctx);
+	assert.equal(calls.length, 0, "legacy config is read when the package config is absent");
+	({ calls, ctx } = collector(noModels));
+	pkgMod.checkConfig(ctx);
+	assert.equal(calls.length, 1, "and it is the legacy roles that get resolved");
+	assert.equal(calls[0][1], "error", "default is router/auto, so a pair that cannot resolve is an error");
 
 	// chooseRating chain ------------------------------------------------------
 	let counter = { self: 0, jev: 0 };

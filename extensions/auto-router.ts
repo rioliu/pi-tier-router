@@ -34,7 +34,7 @@
  * Select with /model -> router/auto; Ctrl+S saves it as the default.
  */
 
-import { mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -107,35 +107,32 @@ const EXTENSION_DIR = ((): string | undefined => {
 })();
 
 /**
- * Where the config lives: next to the extension file, so it is removed with
- * it. Package installs (npm and git sources) are copied into Pi's managed
- * directories, which `pi update` may replace wholesale - config stored there
- * would be lost - so those fall back to the user's extensions directory:
- * stable across updates, and still not Pi's own settings pocket.
+ * The config lives next to the extension file, so uninstalling the extension
+ * takes its config with it - the rule this extension was designed around.
+ * Verified safe for updates: `pi update` preserves files inside the package
+ * directory for both npm and git sources. If the config is missing here, an
+ * older copy in <agent-dir>/extensions is still read, and the next save
+ * supersedes it so nothing is stranded after an uninstall.
  */
-function realPath(target: string): string {
+function configDir(): string {
+	return EXTENSION_DIR ?? path.join(agentDir(), "extensions");
+}
+
+/** Compare two paths, resolving symlinks: import.meta.url is a realpath while
+ * agentDir() may sit behind one (macOS /var -> /private/var), so equal files
+ * can compare unequal as strings. */
+function samePath(a: string, b: string): boolean {
+	if (a === b) return true;
 	try {
-		return realpathSync(target);
+		return realpathSync(a) === realpathSync(b);
 	} catch {
-		// Parent may not exist yet; compare the literal path.
-		return target;
+		return path.resolve(a) === path.resolve(b);
 	}
 }
 
-function isManagedInstall(dir: string): boolean {
-	if (dir.includes(`${path.sep}node_modules${path.sep}`)) return true;
-	// Compare real paths: import.meta.url is a realpath, and the agent dir may
-	// sit behind a symlink (e.g. macOS /var -> /private/var).
-	const realDir = realPath(dir);
-	return ["npm", "git"].some((name) => {
-		const managed = realPath(path.join(agentDir(), name));
-		return realDir === managed || realDir.startsWith(`${managed}${path.sep}`);
-	});
-}
-
-function configDir(): string {
-	if (EXTENSION_DIR && !isManagedInstall(EXTENSION_DIR)) return EXTENSION_DIR;
-	return path.join(agentDir(), "extensions");
+/** Where builds before this fix kept the config for package installs. */
+function legacyConfigFile(): string {
+	return path.join(agentDir(), "extensions", CONFIG_FILE);
 }
 
 function configFile(): string {
@@ -143,7 +140,10 @@ function configFile(): string {
 }
 
 function readOwnConfig(): Record<string, unknown> | undefined {
-	return readJson(configFile());
+	const own = readJson(configFile());
+	if (own) return own;
+	const legacy = legacyConfigFile();
+	return samePath(legacy, configFile()) ? undefined : readJson(legacy);
 }
 
 /** Write the extension's config; returns the path written. */
@@ -151,6 +151,11 @@ export function writeOwnConfig(flashModel: string, proModel: string): string {
 	mkdirSync(configDir(), { recursive: true });
 	const file = configFile();
 	writeFileSync(file, `${JSON.stringify({ "flash-model": flashModel, "pro-model": proModel }, null, 2)}\n`);
+	// Supersede an older copy so uninstalling never leaves it stranded - but only
+	// when it really is a different file, never when a symlink makes the paths
+	// look different while pointing at the same file.
+	const legacy = legacyConfigFile();
+	if (existsSync(legacy) && !samePath(legacy, file)) rmSync(legacy);
 	refreshRoles();
 	return file;
 }

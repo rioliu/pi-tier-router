@@ -59,12 +59,22 @@ Routing only runs while `router/auto` is selected. With any other model — incl
 
 ## Configure
 
-The extension owns its config, next to the extension itself:
+The extension owns its config, **next to the extension file** — so uninstalling the
+extension takes its config with it:
 
 ```
-~/.pi/agent/extensions/auto-router.json      # plain file install
-~/.pi/agent/extensions/auto-router.json      # npm install (config survives `pi update`)
+<install-dir>/extensions/auto-router.json
 ```
+
+| install method | config path |
+|---|---|
+| plain file | `~/.pi/agent/extensions/auto-router.json` |
+| `pi install npm:` | `~/.pi/agent/npm/node_modules/pi-tier-router/extensions/auto-router.json` |
+| `pi install git:` | `~/.pi/agent/git/github.com/rioliu/pi-tier-router/extensions/auto-router.json` |
+
+`pi update` preserves the file — verified for both npm and git sources. If an older copy is
+sitting in `~/.pi/agent/extensions/`, it is still read, and the next `/auto-router` save writes
+the new location and removes it.
 
 ```json
 {
