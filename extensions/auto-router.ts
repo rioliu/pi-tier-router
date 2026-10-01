@@ -3,18 +3,22 @@
  * (cheap default) and pro model (strong escalation) by the difficulty of the
  * issue. Family-agnostic: both roles come from settings.json.
  *
- * Rating chain (mirrors Claude Code's haiku/sonnet/opus tiering, with the
- * decision made locally first):
+ * Decision chain (mirrors Claude Code's haiku/sonnet/opus tiering, with a
+ * local layer first and the decision taken per prompt):
  *
- *   1. The flash model rates the issue and reports a confidence. At or above
- *      the confidence bar the decision is final and Jev is never contacted.
+ *   0. When the prompt arrives (before_agent_start) a local feature router
+ *      reads it and decides at once when the signals are clear: 0 ms, no
+ *      tokens, deterministic. Mixed or missing signals make it abstain.
+ *   1. On abstain the flash model rates the issue and reports a confidence.
+ *      At or above the confidence bar the decision is final and Jev is never
+ *      contacted.
  *   2. Only when the flash model is unsure is Jev consulted, and only if
  *      JEVMODEL_API_KEY is configured. Jev is an optional fallback, not a
  *      dependency.
  *   3. With no Jev available, that lean is kept.
- *   4. If neither rater produced anything (self n/a and Jev n/a), routing stops:
- *      the branch keeps the model it is already on, and a brand-new session
- *      keeps flash. Nothing is guessed.
+ *   4. If neither rater produced anything (self n/a and Jev n/a), routing
+ *      stops: the branch keeps the model it is already on, and a brand-new
+ *      session keeps flash. Nothing is guessed.
  *
  * The pair is checked before anything else. When the configured flash and pro
  * models are not both registered the router disables itself: the model
@@ -26,10 +30,12 @@
  * pro default is never intercepted. The model stays listed in /model, so
  * picking it explicitly opts back into routing for that session.
  *
- * The choice is stored as router state, so it is made once per session branch
- * and later turns keep their prompt cache. Requests outside the agent loop
+ * route() serves the decision taken at prompt time to every request of that
+ * agent run - tool-loop continuations included - so one prompt is one
+ * decision, and the next prompt re-decides. Requests outside the agent loop
  * (compaction summaries) go to flash. Set AUTO_ROUTER_DEBUG=1 for a one-line
- * trace of which source decided.
+ * trace of which layer decided; /auto-router status reports how often the
+ * local layer decided on its own.
  *
  * Select with /model -> router/auto; Ctrl+S saves it as the default.
  */
@@ -243,7 +249,9 @@ const PRO_THRESHOLD = 0.8;
 const RATING_PROMPT_CHARS = 6_000;
 
 type Difficulty = "flash" | "pro";
-type RatingSource = "self" | "jev" | "keep";
+type RatingSource = "local" | "self" | "jev" | "keep";
+/** What the prompt-time hook recorded: a local decision, or "chain" when the
+ * local layer abstained and the model-based chain must decide at request time. */
 
 interface SelfRating {
 	rated: Difficulty;
@@ -252,7 +260,7 @@ interface SelfRating {
 
 interface AutoState {
 	rated: Difficulty;
-	/** Which step of the chain decided; absent when inherited from a previous turn. */
+	/** Which layer decided; absent when inherited from a previous turn. */
 	source?: RatingSource;
 }
 
@@ -268,6 +276,166 @@ Fields:
 - confidence: your certainty in that rating, from 0 to 1.
 
 When the task is routine or ambiguous, answer "flash".`;
+
+/**
+ * Layer 0: the local router. Pure feature matching over the prompt - no model
+ * call, no network, deterministic, instant. Each signal adds weight to one
+ * side; a side wins only when it clears its own bar AND is ahead of the other,
+ * so mixed or absent signals abstain and the prompt falls through to the flash
+ * model. Abstaining is the safety valve: local coverage is grown by adding
+ * signals (from logged data later), never by forcing a decision.
+ */
+export interface LocalDecision {
+	rated: Difficulty;
+	/** Margin-derived; reported in the trace and status only. */
+	confidence: number;
+	/** Which signals fired, for the trace. */
+	signals: string[];
+}
+
+interface LocalSignal {
+	name: string;
+	side: Difficulty;
+	weight: number;
+	re: RegExp;
+}
+
+const LOCAL_SIGNALS: LocalSignal[] = [
+	// pro: work a fast model tends to get wrong (must total >= 3 to decide).
+	{
+		name: "stack-trace",
+		side: "pro",
+		weight: 3,
+		re: /traceback \(most recent call last\)|\bpanic:|segmentation fault|\bcore dumped\b|\bat \S[^\n]*:\d+:\d+/,
+	},
+	{
+		name: "concurrency",
+		side: "pro",
+		weight: 3,
+		re: /\b(race condition|data race|deadlock|livelock|thread[- ]safe|mutex|atomic(?:ity)?|memory leak|use[- ]after[- ]free|double[- ]free)\b/i,
+	},
+	{
+		name: "architecture",
+		side: "pro",
+		weight: 3,
+		re: /\b(architect(?:ure|ural)?|redesign|refactor(?:ing)?|migrat(?:ion|e|ing)|backward[- ]compat(?:ible|ibility)?|breaking change|cross[- ]cutting|decoupl(?:e|ed|ing))\b/i,
+	},
+	{
+		name: "security",
+		side: "pro",
+		weight: 3,
+		re: /\b(vulnerabilit(?:y|ies)|CVE-\d{4}-\d+|inject(?:ion)?|XSS|CSRF|auth(?:entication|orization)? bypass|encrypt(?:ion|ed)?)\b/i,
+	},
+	{
+		name: "hard-debug",
+		side: "pro",
+		weight: 2,
+		re: /\b(root[- ]cause|not working|broken|crash(?:es|ed|ing)?|segfault|flaky|reproduc(?:e|ible)|fail(?:ing|ed|s)?)\b/i,
+	},
+	{
+		name: "performance",
+		side: "pro",
+		weight: 2,
+		re: /\b(optimi[sz](?:e|ed|ing|ation)|latency|bottleneck|scal(?:e|ing|ability)|N\+1)\b/i,
+	},
+	{
+		name: "wide-scope",
+		side: "pro",
+		weight: 2,
+		re: /\b(across (?:all|the) (?:files|modules|services|repos)|whole (?:codebase|project)|end[- ]to[- ]end|all (?:of )?the (?:files|modules|repos))\b/i,
+	},
+	// flash: work a fast model handles reliably (must total >= 2 to decide).
+	{
+		name: "trivial",
+		side: "flash",
+		weight: 3,
+		re: /^\s*(?:hi+|hello|hey|thanks|thank you|ok(?:ay)?|yes|no|continue|go ahead|please proceed|lgtm|done)[.!\s]*$/i,
+	},
+	{
+		name: "lookup",
+		side: "flash",
+		weight: 2,
+		re: /\b(?:what (?:is|does|are|was)|where (?:is|are|can)|explain|describe|summar(?:y|ize|ise)|which (?:one|file|function)|show me|read (?:the|this)|list)\b/i,
+	},
+	{
+		name: "small-edit",
+		side: "flash",
+		weight: 2,
+		re: /\b(?:typo|comments?|readme|docs?|documentation|whitespace|indent(?:ation)?|cosmetic|rename|spelling|grammar|format(?:ting)?)\b/i,
+	},
+];
+
+function localConfidence(margin: number): number {
+	return Math.min(0.97, 0.85 + 0.04 * margin);
+}
+
+/** Decide from the prompt alone; undefined means "abstain, ask the flash model". */
+export function decideLocally(prompt: string): LocalDecision | undefined {
+	if (!prompt.trim()) return undefined;
+	let proScore = 0;
+	let flashScore = 0;
+	const pro: string[] = [];
+	const flash: string[] = [];
+	for (const signal of LOCAL_SIGNALS) {
+		if (!signal.re.test(prompt)) continue;
+		if (signal.side === "pro") {
+			proScore += signal.weight;
+			pro.push(signal.name);
+		} else {
+			flashScore += signal.weight;
+			flash.push(signal.name);
+		}
+	}
+	// Structural features that are about shape rather than wording.
+	if ((prompt.match(/```/g)?.length ?? 0) >= 4 && prompt.length >= 1_000) {
+		proScore += 1;
+		pro.push("big-context");
+	}
+	if (new Set(prompt.match(/[\w./-]+\.[A-Za-z]{1,6}\b/g) ?? []).size >= 3) {
+		proScore += 1;
+		pro.push("multi-file");
+	}
+	if (prompt.length < 80) {
+		flashScore += 1;
+		flash.push("short");
+	}
+	if (prompt.length < 400 && prompt.includes("?")) {
+		flashScore += 1;
+		flash.push("question");
+	}
+
+	if (proScore >= 3 && proScore > flashScore) {
+		return { rated: "pro", confidence: localConfidence(proScore - flashScore), signals: pro };
+	}
+	if (flashScore >= 2 && flashScore > proScore) {
+		return { rated: "flash", confidence: localConfidence(flashScore - proScore), signals: flash };
+	}
+	return undefined;
+}
+
+/** Per-session counters for /auto-router status: which layer decided what. */
+export const stats = {
+	prompts: 0,
+	local: 0,
+	abstain: 0,
+	self: 0,
+	jev: 0,
+	keep: 0,
+	direct: 0,
+	inherited: 0,
+};
+
+function resetStats(): void {
+	Object.keys(stats).forEach((key) => ((stats as Record<string, number>)[key] = 0));
+}
+
+/** The decision taken when the prompt arrived; read by route() for every
+ * request of that agent run and cleared when the run ends. */
+type TurnDecision =
+	| { source: "chain" } // local layer abstained: the chain decides at request time
+	| { rated: Difficulty; source: RatingSource }; // some layer already decided
+
+let PENDING: TurnDecision | undefined;
 
 function routeTo(request: AutoRequest, ctx: ExtensionContext, rated: Difficulty, state?: AutoState): ModelRoute<AutoState> {
 	const role = rated === "pro" ? ROLES.pro : ROLES.flash;
@@ -296,7 +464,8 @@ function resolvePair(registry: Registry) {
  * disabled router never spends a Jev or mimo call.
  */
 async function disabledRoute(request: AutoRequest, ctx: ExtensionContext): Promise<ModelRoute<AutoState>> {
-	const previous = request.previous;
+	// request.previous is { model, thinkingLevel }, not the model itself.
+	const previous = request.previous?.model;
 	if (previous && ctx.modelRegistry.hasConfiguredAuth(previous)) {
 		return { model: previous, thinkingLevel: request.thinkingLevel };
 	}
@@ -554,36 +723,55 @@ async function routeVirtual(request: AutoRequest, ctx: ExtensionContext): Promis
 	if (!resolvePair(ctx.modelRegistry)) return disabledRoute(request, ctx);
 
 	// Compaction summaries and other out-of-loop calls stay cheap.
-	if (request.reason === "direct") return routeTo(request, ctx, "flash");
-
-	const state = request.state;
-	if (state?.rated) return routeTo(request, ctx, state.rated, state);
-
-	// No decision stored yet (resumed session, follow-up): inherit the
-	// model that handled the previous response so the cache stays warm.
-	const previous = request.previous;
-	const previousRole: Difficulty | undefined = isRole(previous?.model, ROLES.pro)
-		? "pro"
-		: isRole(previous?.model, ROLES.flash)
-			? "flash"
-			: undefined;
-	if (request.reason !== "user" && previousRole) {
-		return routeTo(request, ctx, previousRole, { rated: previousRole });
+	if (request.reason === "direct") {
+		stats.direct++;
+		return routeTo(request, ctx, "flash");
 	}
 
-	// First request carrying the issue: rate it once, then stay sticky.
+	// The decision taken when this prompt arrived. Every request of the run -
+	// tool-loop continuations included - is served by it, so one prompt is one
+	// decision and the cache stays warm inside the run.
+	if (PENDING && PENDING.source !== "chain") {
+		return routeTo(request, ctx, PENDING.rated, { rated: PENDING.rated, source: PENDING.source });
+	}
+
+	// The hook did not run for this request (resume, late extension load):
+	// reuse what the branch already decided instead of re-rating blindly.
+	if (!PENDING) {
+		const state = request.state;
+		if (state?.rated) {
+			stats.inherited++;
+			return routeTo(request, ctx, state.rated, state);
+		}
+		const previousRole: Difficulty | undefined = isRole(request.previous?.model, ROLES.pro)
+			? "pro"
+			: isRole(request.previous?.model, ROLES.flash)
+				? "flash"
+				: undefined;
+		if (request.reason !== "user" && previousRole) {
+			stats.inherited++;
+			return routeTo(request, ctx, previousRole, { rated: previousRole });
+		}
+	}
+
+	// The local layer abstained (or the hook never ran): rate the issue here.
 	const prompt = lastUserText(request.messages);
 	const started = Date.now();
 	// "Current model" for step 4: pro when this branch is already on pro,
 	// otherwise flash (a brand-new session has no current model yet).
-	const keep: Difficulty = isRole(previous?.model, ROLES.pro) ? "pro" : "flash";
+	const keep: Difficulty = isRole(request.previous?.model, ROLES.pro) ? "pro" : "flash";
+	// request.signal is optional; with none, the raters' own deadlines apply.
+	const signal = request.signal ?? new AbortController().signal;
 	const { rated, source } = await chooseRating({
 		keep,
-		self: () => rateWithSelf(prompt, ctx, request.signal),
-		jev: () => rateWithJev(prompt, request.signal),
+		self: () => rateWithSelf(prompt, ctx, signal),
+		jev: () => rateWithJev(prompt, signal),
 		trace: (line) => debugRating(line),
 	});
 	debugRating(`decided ${source}/${rated} in ${Date.now() - started}ms`);
+	if (source === "self" || source === "jev" || source === "keep") stats[source]++;
+	// Remember it for the rest of this run so continuations do not re-rate.
+	PENDING = { rated, source };
 	return routeTo(request, ctx, rated, { rated, source });
 }
 
@@ -614,12 +802,15 @@ export default function (pi: ExtensionAPI) {
 			const status = (): string[] => {
 				const roles = readRoles();
 				const pair = resolvePair(ctx.modelRegistry);
+				const coverage = stats.prompts ? Math.round((stats.local / stats.prompts) * 100) : 0;
 				return [
 					`config:  ${configFile()}${readOwnConfig() ? "" : "  (missing - run /auto-router to create it)"}`,
 					`flash:   ${roles.flash.provider}/${roles.flash.id}`,
 					`pro:     ${roles.pro.provider}/${roles.pro.id}`,
 					`pair:    ${pair ? "resolved in catalog" : "NOT available"}`,
 					`default: ${readDefaultModel() ?? "(unset)"}`,
+					`local:   ${stats.local}/${stats.prompts} prompts decided locally (${coverage}%), ${stats.abstain} sent to the chain`,
+					`chain:   self ${stats.self}, jev ${stats.jev}, keep ${stats.keep}, direct ${stats.direct}, inherited ${stats.inherited}`,
 				];
 			};
 			const parts = args.trim().split(/\s+/).filter(Boolean);
@@ -681,6 +872,9 @@ export default function (pi: ExtensionAPI) {
 	// availability comes from the registry, and other extensions can register
 	// providers after this one loads.
 	pi.on("session_start", (_event, ctx) => {
+		// A session (or branch) switch starts this session's tally over.
+		PENDING = undefined;
+		resetStats();
 		const available = Boolean(resolvePair(ctx.modelRegistry));
 		const selected = ctx.model?.provider === VIRTUAL_PROVIDER && ctx.model?.id === VIRTUAL_ID;
 		if (available && !registered) {
@@ -698,5 +892,32 @@ export default function (pi: ExtensionAPI) {
 	// removed pro model is reported (and roles re-read) without a restart.
 	pi.on("ui_prompt_start", (_event, ctx) => {
 		checkConfig(ctx);
+	});
+
+	// Read the prompt the moment it arrives and settle the decision for the
+	// whole agent run before it starts; route() then serves that decision to
+	// every request in the loop.
+	pi.on("before_agent_start", (event, ctx) => {
+		if (!registered) return;
+		// Nothing to do when another model is explicitly selected for this run.
+		if (ctx.model && (ctx.model.provider !== VIRTUAL_PROVIDER || ctx.model.id !== VIRTUAL_ID)) return;
+		if (!resolvePair(ctx.modelRegistry)) return;
+		stats.prompts++;
+		const local = decideLocally(event.prompt ?? "");
+		if (local) {
+			stats.local++;
+			PENDING = { rated: local.rated, source: "local" };
+			debugRating(`local ${local.rated} conf=${local.confidence.toFixed(2)} via ${local.signals.join("+")}`);
+			return;
+		}
+		stats.abstain++;
+		PENDING = { source: "chain" };
+		debugRating("local abstain; flash rating chain decides");
+	});
+
+	// One prompt is one decision: drop it when the run ends so the next prompt
+	// re-decides instead of inheriting this one.
+	pi.on("agent_end", () => {
+		PENDING = undefined;
 	});
 }

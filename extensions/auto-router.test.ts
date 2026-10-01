@@ -16,13 +16,11 @@ copyFileSync(REAL, COPY);
 writeFileSync(path.join(root, "settings.json"), JSON.stringify({ defaultProvider: "router", defaultModel: "auto" }));
 process.env.PI_CODING_AGENT_DIR = root;
 
-const { chooseRating, parseRole, parseSelfRating, checkConfig, writeOwnConfig } = await import(
-	pathToFileURL(COPY).href
-);
+const { default: factory, chooseRating, decideLocally, stats, parseRole, parseSelfRating, checkConfig, writeOwnConfig } =
+	await import(pathToFileURL(COPY).href);
 
-// Package installs live under Pi's managed git/npm directories; their config
-// must fall back to <agent-dir>/extensions instead of being written into a
-// tree that `pi update` can replace.
+// Package installs keep their config next to their own extension file, with an
+// older <agent-dir>/extensions copy read as a fallback until it is superseded.
 const PKG_EXTENSIONS = path.join(root, "git", "github.com", "rioliu", "pi-tier-router", "extensions");
 mkdirSync(PKG_EXTENSIONS, { recursive: true });
 const PKG_COPY = path.join(PKG_EXTENSIONS, "auto-router.ts");
@@ -40,6 +38,11 @@ function registry(models: { provider: string; id: string }[]) {
 	return {
 		find: (provider: string, id: string) => models.find((m) => m.provider === provider && m.id === id),
 		hasConfiguredAuth: () => true,
+		// Nothing in these tests may reach a model: the rating chain must
+		// treat this as "rater unavailable" and fall through.
+		complete: async () => {
+			throw new Error("no completion in tests");
+		},
 	} as never;
 }
 const noModels = registry([]);
@@ -236,7 +239,7 @@ async function run() {
 	assert.equal(counter.jev, 1);
 
 	const lines: string[] = [];
-	await chooseRating({ keep: "flash", trace: (line) => lines.push(line) });
+	await chooseRating({ keep: "flash", trace: (line: string) => lines.push(line) });
 	assert.deepEqual(lines, ["self unavailable", "jev=unavailable", "no rater available, keeping flash"]);
 
 	// parseSelfRating ---------------------------------------------------------
@@ -268,7 +271,122 @@ async function run() {
 	assert.equal(parseRole(42, FALLBACK), FALLBACK);
 	assert.equal(parseRole(undefined, FALLBACK), FALLBACK);
 
-	console.log("all checkConfig + writeOwnConfig + chooseRating + parseRole + parseSelfRating assertions passed");
+	// decideLocally: layer 0 decides from the prompt alone ----------------------
+	const localCases: [string, "flash" | "pro" | undefined, string?][] = [
+		["hi", "flash", "trivial"],
+		["explain what this function does", "flash", "lookup"],
+		["fix the typo in the README", "flash", "small-edit"],
+		["TypeError: x is not a function\n    at run (/app/src/index.ts:42:11)", "pro", "stack-trace"],
+		["eliminate the race condition in the worker pool", "pro", "concurrency"],
+		["refactor authentication across all services", "pro", "architecture"],
+		["fix the failing test", undefined], // medium work: abstain, chain decides
+		["add a button to the header", undefined],
+		["", undefined],
+		["fix the race condition in the task queue right now, or is this just a typo in the comment?", undefined],
+	];
+	for (const [prompt, expected, signal] of localCases) {
+		const decision = decideLocally(prompt);
+		assert.equal(
+			decision?.rated,
+			expected,
+			`decideLocally(${JSON.stringify(prompt)}) -> ${decision?.rated ?? "abstain"}`,
+		);
+		if (decision) {
+			assert.ok(decision.confidence >= 0.85 && decision.confidence <= 0.97, "confidence stays in band");
+			if (signal) assert.ok(decision.signals.includes(signal), `expected ${signal} in ${decision.signals.join("+")}`);
+		}
+	}
+	// shape features: two code blocks, 1000+ chars, several file paths
+	const big =
+		"```ts\n" +
+		"export const a = 1; // src/app.ts\n".repeat(40) +
+		"```\n```js\n" +
+		"export const b = 2; // lib/util.js\n".repeat(30) +
+		"```\ncoordinate this across all services: config.yaml, main.tf and Makefile must change together";
+	const bigDecision = decideLocally(big);
+	assert.equal(bigDecision?.rated, "pro", "large multi-file change goes to pro");
+	assert.ok(bigDecision.signals.includes("big-context") && bigDecision.signals.includes("multi-file"));
+
+	// before_agent_start -> route(): one prompt, one decision -------------------
+	ownConfig({ "flash-model": `${MIMO}/mimo-v2.6-flash`, "pro-model": `${MIMO}/mimo-v2.6-pro` });
+	const handlers = new Map<string, any>();
+	let routed: any;
+	factory({
+		on: (event: string, handler: any) => {
+			handlers.set(event, handler);
+			return () => {};
+		},
+		registerVirtualModel: (spec: any) => {
+			routed = spec.route;
+		},
+		unregisterVirtualModel: () => {},
+		registerCommand: () => {},
+	});
+	assert.equal(typeof routed, "function", "router registers when config exists");
+
+	const mimoReg = registry([
+		{ provider: MIMO, id: "mimo-v2.6-flash" },
+		{ provider: MIMO, id: "mimo-v2.6-pro" },
+	]);
+	const wireCtx: any = { modelRegistry: mimoReg, model: { provider: "router", id: "auto" }, hasUI: false };
+	const userReq = (prompt: string, reason = "user") => ({
+		reason,
+		messages: [{ role: "user", content: prompt, timestamp: Date.now() }],
+		thinkingLevel: "medium",
+		state: undefined,
+		previous: undefined,
+		signal: undefined,
+	});
+	const fire = (event: string, payload?: unknown, ctx: unknown = wireCtx) => handlers.get(event)!(payload, ctx);
+	const modelOf = (r: any) => `${r.model.provider}/${r.model.id}`;
+	const savedJevKey = process.env.JEVMODEL_API_KEY;
+	delete process.env.JEVMODEL_API_KEY;
+
+	fire("session_start", {}); // resets the tally and re-checks config
+	assert.equal(stats.prompts, 0, "session_start resets the tally");
+
+	// trivial prompt: decided locally, no rater ever called
+	fire("before_agent_start", { prompt: "hi" });
+	assert.equal(stats.prompts, 1);
+	assert.equal(stats.local, 1);
+	const localFlash = await routed(userReq("hi"), wireCtx);
+	assert.equal(modelOf(localFlash), `${MIMO}/mimo-v2.6-flash`, "trivial prompt routes to flash");
+	assert.equal(localFlash.state.source, "local");
+	// a tool-loop continuation inside the same run reuses that decision
+	const continuation = await routed(userReq("tool result", "tool"), wireCtx);
+	assert.equal(modelOf(continuation), `${MIMO}/mimo-v2.6-flash`, "continuation keeps the turn's decision");
+	assert.equal(stats.self, 0, "no rating call when the local layer decided");
+
+	// stack trace: pro, still decided locally
+	fire("agent_end");
+	const stackPrompt = "TypeError: boom\n    at run (/app/x.ts:1:1)";
+	fire("before_agent_start", { prompt: stackPrompt });
+	const localPro = await routed(userReq(stackPrompt), wireCtx);
+	assert.equal(modelOf(localPro), `${MIMO}/mimo-v2.6-pro`, "stack trace routes to pro");
+	assert.equal(stats.local, 2);
+
+	// ambiguous prompt: local abstains, the chain decides (no rater reachable
+	// here and no Jev key, so the branch keeps its current model)
+	fire("agent_end");
+	fire("before_agent_start", { prompt: "add a button to the header" });
+	assert.equal(stats.abstain, 1, "ambiguous prompt is counted as an abstain");
+	const chained = await routed(userReq("add a button to the header"), wireCtx);
+	assert.equal(modelOf(chained), `${MIMO}/mimo-v2.6-flash`, "chain keeps flash with no rater available");
+	assert.equal(chained.state.source, "keep");
+	assert.equal(stats.keep, 1);
+	assert.equal(stats.jev, 0, "Jev stays untouched without its key");
+
+	// another model selected: the router does not claim the prompt
+	fire("agent_end");
+	fire("before_agent_start", { prompt: "hi" }, { ...wireCtx, model: { provider: MIMO, id: "mimo-v2.6-flash" } });
+	assert.equal(stats.prompts, 3, "prompts for another model are not counted");
+
+	if (savedJevKey === undefined) delete process.env.JEVMODEL_API_KEY;
+	else process.env.JEVMODEL_API_KEY = savedJevKey;
+
+	console.log(
+		"all checkConfig + writeOwnConfig + chooseRating + parseRole + parseSelfRating + decideLocally + hook/route assertions passed",
+	);
 }
 
 run()

@@ -19,21 +19,30 @@ This is the same tiering idea as Claude Code's haiku/sonnet/opus model levels �
 
 ## What it does
 
-Pi exposes the router as a virtual model, `router/auto`. While it is selected, the first user message of each session is rated once and the result is stored for the rest of that session branch:
+Pi exposes the router as a virtual model, `router/auto`. While it is selected, **every prompt is
+decided on its own** the moment it arrives, and that decision serves the whole agent run (tool loop
+included):
 
 ```
-first user message
-  1. flash model rates the issue itself (rating + confidence)
+prompt arrives (before_agent_start)
+  0. local router reads the prompt: 0 ms, no tokens, deterministic
+       clear signals  -> decided right away (flash or pro)
+       mixed/missing  -> abstain
+  1. on abstain: flash model rates the issue itself (rating + confidence)
        confidence >= 0.8  -> decision is final, nothing else is consulted
   2. unsure  -> ask Jev, but only if JEVMODEL_API_KEY is configured
   3. no Jev  -> keep the flash model's lean
   4. neither -> keep the current model (flash for a new session); routing stops
 ```
 
-- **Rated once per session branch**, so later turns keep their prompt cache and cost nothing extra.
-- **Jev is optional**, never a dependency. In normal operation it is called zero times.
+- **One prompt, one decision** — the next prompt re-decides, so a hard task can escalate without
+  locking the whole session to pro.
+- **Local first**: routine and obviously hard prompts never reach a model. `/auto-router status`
+  reports how often the local layer decided on its own.
+- **Jev is optional**, never a dependency — consulted only when the local layer abstains *and* the
+  flash model is unsure.
 - **Compaction summaries** always run on the flash model.
-- The deciding call is bounded at 10s and uses minimal reasoning, so it never holds up a turn.
+- The model-based decision is bounded at 10s and uses minimal reasoning, so it never holds up a turn.
 
 ## Install
 
@@ -113,6 +122,13 @@ Issues are announced when they appear, not on every prompt.
 ```
 AUTO_ROUTER_DEBUG=1 pi
 [auto-router] roles flash=... pro=...
+[auto-router] local pro conf=0.93 via concurrency
+```
+
+Local decisions print a single line and cost nothing. Only an abstain reaches the model chain:
+
+```
+[auto-router] local abstain; flash rating chain decides
 [auto-router] self rated=pro conf=0.92
 [auto-router] decided self/pro in 1432ms
 ```
@@ -133,7 +149,9 @@ Both role models must be registered in `models.json` with working credentials.
 npm test        # node >= 23 (native TypeScript stripping)
 ```
 
-The suite covers the decision chain, config persistence and refresh, change warnings, and the `provider/model-id` parser. It runs against a temporary copy of the extension, so it never writes into your real Pi directory.
+The suite covers the local router's signal table, the decision chain, the hook → route() wiring,
+config persistence and refresh, change warnings, and the `provider/model-id` parser. It runs against
+a temporary copy of the extension, so it never writes into your real Pi directory.
 
 ## License
 

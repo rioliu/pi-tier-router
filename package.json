@@ -1,6 +1,6 @@
 {
   "name": "pi-tier-router",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Pi extension that routes each session between a cheap flash model and a strong pro model based on issue difficulty - Claude Code style haiku/sonnet/opus tiering, config-driven for any model family.",
   "type": "module",
   "license": "MIT",
