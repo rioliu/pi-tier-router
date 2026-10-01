@@ -10,8 +10,8 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 // module snapshots the default model at import (LOAD_DEFAULT).
 const root = mkdtempSync(path.join(os.tmpdir(), "auto-router-root-"));
 mkdirSync(path.join(root, "extensions"));
-const REAL = path.join(path.dirname(fileURLToPath(import.meta.url)), "auto-router.ts");
-const COPY = path.join(root, "extensions", "auto-router.ts");
+const REAL = path.join(path.dirname(fileURLToPath(import.meta.url)), "index.ts");
+const COPY = path.join(root, "extensions", "index.ts");
 copyFileSync(REAL, COPY);
 writeFileSync(path.join(root, "settings.json"), JSON.stringify({ defaultProvider: "router", defaultModel: "auto" }));
 process.env.PI_CODING_AGENT_DIR = root;
@@ -23,7 +23,7 @@ const { default: factory, chooseRating, decideLocally, analyzePrompt, textSketch
 // older <agent-dir>/extensions copy read as a fallback until it is superseded.
 const PKG_EXTENSIONS = path.join(root, "git", "github.com", "rioliu", "pi-tier-router", "extensions");
 mkdirSync(PKG_EXTENSIONS, { recursive: true });
-const PKG_COPY = path.join(PKG_EXTENSIONS, "auto-router.ts");
+const PKG_COPY = path.join(PKG_EXTENSIONS, "index.ts");
 copyFileSync(COPY, PKG_COPY);
 const pkgMod = await import(pathToFileURL(PKG_COPY).href);
 
