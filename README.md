@@ -111,6 +111,8 @@ Create or change it with the built-in wizard:
 |---|---|
 | `/auto-router` | interactive: pick both roles from the models Pi can reach |
 | `/auto-router status` | show config path, both roles, whether the pair resolves, current default |
+| `/auto-router memory` | show the decision store: path, size, ring fill, session reuse, recent verdicts |
+| `/auto-router memory reset` | wipe the store — it rebuilds itself from new verdicts |
 | `/auto-router set flash=<provider/id> pro=<provider/id>` | write the config and reload |
 
 The wizard writes only its own file. **`models.json` is never touched** — availability is read from Pi's live model registry — and the only value read from `settings.json` is your default model id, used to warn you when it changes.

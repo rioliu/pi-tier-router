@@ -43,7 +43,7 @@
  * Select with /model -> router/auto; Ctrl+S saves it as the default.
  */
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -753,6 +753,12 @@ export function memoryEntries(): number {
 	return MEMORY?.count ?? 0;
 }
 
+/** Re-read the journal now (explicit commands) and return the ring size. */
+export function reloadMemory(): number {
+	MEMORY = undefined;
+	return memory().count;
+}
+
 /** A chain verdict from the abstain zone becomes a stored example. Local
  * decisions and "keep" (no rater answered) are never stored: they would only
  * echo the rule that produced them. */
@@ -1242,6 +1248,58 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
+			if (sub === "memory") {
+				const action = parts[1];
+				if (action === "reset" || action === "clear") {
+					const file = memoryFile();
+					const existed = existsSync(file);
+					rmSync(file, { force: true });
+					resetMemoryCache();
+					stats.memoryLookups = 0;
+					stats.memoryReused = 0;
+					say(
+						existed
+							? `Decision store cleared (${file}); it rebuilds itself as new verdicts arrive.`
+							: "Decision store was already empty.",
+					);
+					return;
+				}
+				if (action) {
+					say("usage: /auto-router memory [reset]", "warning");
+					return;
+				}
+				const file = memoryFile();
+				const present = existsSync(file);
+				const entries = reloadMemory();
+				const reuse = stats.memoryLookups
+					? `${Math.round((stats.memoryReused / stats.memoryLookups) * 100)}%`
+					: "n/a";
+				const lines = [
+					`store:   ${file}  ${present ? `(${(statSync(file).size / 1024).toFixed(1)} KB)` : "(absent - builds as verdicts arrive)"}`,
+					`entries: ${entries} in ring (cap ${MEMORY_RING}), journal trimmed at ${MEMORY_KEEP_LINES} lines`,
+					`session: ${stats.memoryReused}/${stats.memoryLookups} lookups reused (${reuse})`,
+					`gates:   profile >= ${SIM_PROFILE_MIN}, text >= ${SIM_TEXT_MIN}, vote >= ${MEM_MIN_HITS} hits / ${MEM_TOP_K} top / ${Math.round(MEM_AGREE * 100)}% agree`,
+				];
+				if (present) {
+					lines.push("recent (oldest first):");
+					const tail = readFileSync(file, "utf8").split("\n").filter(Boolean).slice(-5);
+					for (const raw of tail) {
+						try {
+							const entry = JSON.parse(raw) as { t?: number; label?: string; by?: string; cls?: string[] };
+							const when =
+								typeof entry.t === "number" ? new Date(entry.t * 1000).toISOString().slice(0, 16).replace("T", " ") : "?";
+							lines.push(
+								`  ${when}  ${String(entry.label ?? "?").padEnd(5)} by ${String(entry.by ?? "?").padEnd(4)}  ${(entry.cls ?? []).join("+")}`,
+							);
+						} catch {
+							lines.push("  (unreadable line)");
+						}
+					}
+				}
+				for (const line of lines) say(line);
+				return;
+			}
+
 			const save = (flashModel: string, proModel: string): boolean => {
 				if (flashModel === proModel) {
 					say("flash and pro must be different models.", "warning");
@@ -1264,14 +1322,14 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (sub) {
-				say("usage: /auto-router | /auto-router status | /auto-router set flash=<id> pro=<id>", "warning");
+				say("usage: /auto-router | /auto-router status | /auto-router memory [reset] | /auto-router set flash=<id> pro=<id>", "warning");
 				return;
 			}
 
 			// Interactive wizard: pick both roles from the models Pi can reach.
 			if (!ctx.hasUI || ctx.mode !== "tui") {
 				for (const line of status()) say(line);
-				say("usage: /auto-router status | /auto-router set flash=<provider/model-id> pro=<provider/model-id>");
+				say("usage: /auto-router status | /auto-router memory [reset] | /auto-router set flash=<provider/model-id> pro=<provider/model-id>");
 				return;
 			}
 			const candidates = (await ctx.modelRegistry.getAvailableOfType("chat"))

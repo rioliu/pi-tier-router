@@ -16,7 +16,7 @@ copyFileSync(REAL, COPY);
 writeFileSync(path.join(root, "settings.json"), JSON.stringify({ defaultProvider: "router", defaultModel: "auto" }));
 process.env.PI_CODING_AGENT_DIR = root;
 
-const { default: factory, chooseRating, decideLocally, analyzePrompt, textSketch, queryMemory, resetMemoryCache, memoryEntries, MEMORY_RING, MEMORY_KEEP_LINES, stats, parseRole, parseSelfRating, checkConfig, writeOwnConfig } =
+const { default: factory, chooseRating, decideLocally, analyzePrompt, textSketch, queryMemory, resetMemoryCache, reloadMemory, memoryEntries, MEMORY_RING, MEMORY_KEEP_LINES, stats, parseRole, parseSelfRating, checkConfig, writeOwnConfig } =
 	await import(pathToFileURL(COPY).href);
 
 // Package installs keep their config next to their own extension file, with an
@@ -317,6 +317,7 @@ async function run() {
 	// before_agent_start -> route(): one prompt, one decision -------------------
 	ownConfig({ "flash-model": `${MIMO}/mimo-v2.6-flash`, "pro-model": `${MIMO}/mimo-v2.6-pro` });
 	const handlers = new Map<string, any>();
+	const commands = new Map<string, any>();
 	let routed: any;
 	factory({
 		on: (event: string, handler: any) => {
@@ -327,7 +328,9 @@ async function run() {
 			routed = spec.route;
 		},
 		unregisterVirtualModel: () => {},
-		registerCommand: () => {},
+		registerCommand: (name: string, spec: any) => {
+			commands.set(name, spec);
+		},
 	});
 	assert.equal(typeof routed, "function", "router registers when config exists");
 
@@ -513,6 +516,30 @@ async function run() {
 	assert.equal(memoryEntries(), MEMORY_RING, "ring keeps at most MEMORY_RING entries");
 	const trimmed = readFileSync(MEMORY_PATH, "utf8").trim().split("\n");
 	assert.ok(trimmed.length <= MEMORY_KEEP_LINES, `journal trimmed to ${trimmed.length} lines`);
+
+	// /auto-router memory: report the store, then wipe it
+	const cmdLines: string[] = [];
+	const origLog = console.log;
+	console.log = (...args: unknown[]) => {
+		cmdLines.push(args.map(String).join(" "));
+	};
+	const cmdCtx: any = { hasUI: false, mode: "headless", modelRegistry: ratingReg, reload: async () => {} };
+	try {
+		assert.ok(commands.has("auto-router"), "wizard command registered");
+		await commands.get("auto-router").handler("memory", cmdCtx);
+		assert.ok(cmdLines.some((line) => line.includes(MEMORY_PATH)), "memory prints the journal path");
+		assert.ok(cmdLines.some((line) => line.includes(`entries: ${MEMORY_RING}`)), "memory prints the ring fill");
+		cmdLines.length = 0;
+		await commands.get("auto-router").handler("memory reset", cmdCtx);
+		assert.ok(cmdLines.some((line) => line.includes("cleared")), "reset confirms the wipe");
+		assert.ok(!existsSync(MEMORY_PATH), "journal removed by reset");
+		assert.equal(memoryEntries(), 0, "ring empty after reset");
+		cmdLines.length = 0;
+		await commands.get("auto-router").handler("memory", cmdCtx);
+		assert.ok(cmdLines.some((line) => line.includes("absent")), "reports an empty store");
+	} finally {
+		console.log = origLog;
+	}
 
 	console.log(
 		"all checkConfig + writeOwnConfig + chooseRating + parseRole + parseSelfRating + decideLocally + hook/route + memory-store assertions passed",
