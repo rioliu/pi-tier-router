@@ -1,5 +1,12 @@
 # pi-tier-router
 
+[![npm](https://img.shields.io/npm/v/pi-tier-router.svg)](https://www.npmjs.com/package/pi-tier-router)
+[![npm downloads](https://img.shields.io/npm/dm/pi-tier-router.svg)](https://www.npmjs.com/package/pi-tier-router)
+[![License: MIT](https://img.shields.io/github/license/rioliu/pi-tier-router)](LICENSE)
+[![Pi extension](https://img.shields.io/badge/Pi-extension-6c5ce7)](https://github.com/earendil-works/pi)
+
+> **Pay for difficulty, not for every message.** Routine work runs on the cheap model; only genuinely hard issues escalate to the strong one.
+
 Route a Pi coding session between a **cheap flash model** and a **strong pro model**, based on how hard the issue actually is.
 
 This is the same tiering idea as Claude Code's haiku/sonnet/opus model levels — most work belongs on the fast, inexpensive model, and a minority of hard issues deserves the strong one. Unlike a fixed tier list, the two roles are configuration: point it at any model family (MiMo, DeepSeek, an OpenAI-compatible endpoint, or a mix of providers).
