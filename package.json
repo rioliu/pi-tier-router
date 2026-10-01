@@ -22,7 +22,7 @@
   },
   "pi": {
     "extensions": [
-      "./extensions/auto-router.ts"
+      "./extensions/index.ts"
     ]
   },
   "files": [
