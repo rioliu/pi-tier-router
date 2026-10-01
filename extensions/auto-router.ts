@@ -9,14 +9,17 @@
  *   0. When the prompt arrives (before_agent_start) a local feature router
  *      reads it and decides at once when the signals are clear: 0 ms, no
  *      tokens, deterministic. Mixed or missing signals make it abstain.
- *   1. On abstain the flash model rates the issue and reports a confidence.
+ *   1. On abstain, the decision store is consulted first: past chain verdicts
+ *      for similar prompts (signal-profile overlap or trigram sketch, k-NN
+ *      vote) are reused without calling any model at all.
+ *   2. Otherwise the flash model rates the issue and reports a confidence.
  *      At or above the confidence bar the decision is final and Jev is never
- *      contacted.
- *   2. Only when the flash model is unsure is Jev consulted, and only if
+ *      contacted - and the verdict is stored so future prompts can reuse it.
+ *   3. Only when the flash model is unsure is Jev consulted, and only if
  *      JEVMODEL_API_KEY is configured. Jev is an optional fallback, not a
  *      dependency.
- *   3. With no Jev available, that lean is kept.
- *   4. If neither rater produced anything (self n/a and Jev n/a), routing
+ *   4. With no Jev available, that lean is kept.
+ *   5. If neither rater produced anything (self n/a and Jev n/a), routing
  *      stops: the branch keeps the model it is already on, and a brand-new
  *      session keeps flash. Nothing is guessed.
  *
@@ -40,7 +43,7 @@
  * Select with /model -> router/auto; Ctrl+S saves it as the default.
  */
 
-import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -249,7 +252,7 @@ const PRO_THRESHOLD = 0.8;
 const RATING_PROMPT_CHARS = 6_000;
 
 type Difficulty = "flash" | "pro";
-type RatingSource = "local" | "self" | "jev" | "keep";
+type RatingSource = "local" | "memory" | "self" | "jev" | "keep";
 /** What the prompt-time hook recorded: a local decision, or "chain" when the
  * local layer abstained and the model-based chain must decide at request time. */
 
@@ -433,9 +436,22 @@ function localConfidence(margin: number): number {
  */
 const MAX_SCAN_CHARS = 32_000;
 
-/** Decide from the prompt alone; undefined means "abstain, ask the flash model". */
-export function decideLocally(prompt: string): LocalDecision | undefined {
-	if (!prompt.length) return undefined;
+/** What the local layer saw, whatever it decided. */
+export interface PromptAnalysis {
+	/** Present when the signals were clear; undefined means abstain. */
+	decision?: LocalDecision;
+	/** Fingerprint for the decision store: classes + margin band. */
+	profile: number;
+	pro: number;
+	flash: number;
+	signals: string[];
+}
+
+/** Analyze a prompt once: the local decision plus the fingerprint the
+ * decision store queries with. Exported for tests; decideLocally is the
+ * usual entry point. */
+export function analyzePrompt(prompt: string): PromptAnalysis {
+	if (!prompt.length) return { profile: makeProfile([], 0, 0), pro: 0, flash: 0, signals: [] };
 	// One bounded copy, reused by every signal below. No trim(): it would copy
 	// the whole paste just to check whether there is content.
 	const text = prompt.length > MAX_SCAN_CHARS ? prompt.slice(0, MAX_SCAN_CHARS) : prompt;
@@ -478,13 +494,25 @@ export function decideLocally(prompt: string): LocalDecision | undefined {
 		flash.push("question");
 	}
 
-	if (proScore >= 3 && proScore > flashScore) {
-		return { rated: "pro", confidence: localConfidence(proScore - flashScore), signals: pro };
-	}
-	if (flashScore >= 2 && flashScore > proScore) {
-		return { rated: "flash", confidence: localConfidence(flashScore - proScore), signals: flash };
-	}
-	return undefined;
+	const decision =
+		proScore >= 3 && proScore > flashScore
+			? { rated: "pro" as const, confidence: localConfidence(proScore - flashScore), signals: pro }
+			: flashScore >= 2 && flashScore > proScore
+				? { rated: "flash" as const, confidence: localConfidence(flashScore - proScore), signals: flash }
+				: undefined;
+	const signals = [...pro, ...flash];
+	return {
+		decision,
+		profile: makeProfile(signals, proScore, flashScore),
+		pro: proScore,
+		flash: flashScore,
+		signals,
+	};
+}
+
+/** Decide from the prompt alone; undefined means "abstain, ask the flash model". */
+export function decideLocally(prompt: string): LocalDecision | undefined {
+	return analyzePrompt(prompt).decision;
 }
 
 /** Per-session counters for /auto-router status: which layer decided what. */
@@ -492,6 +520,8 @@ export const stats = {
 	prompts: 0,
 	local: 0,
 	abstain: 0,
+	memoryLookups: 0,
+	memoryReused: 0,
 	self: 0,
 	jev: 0,
 	keep: 0,
@@ -506,10 +536,317 @@ function resetStats(): void {
 /** The decision taken when the prompt arrived; read by route() for every
  * request of that agent run and cleared when the run ends. */
 type TurnDecision =
-	| { source: "chain" } // local layer abstained: the chain decides at request time
+	| { source: "chain"; profile: number; sketch: Uint32Array } // abstained: features kept for the store
 	| { rated: Difficulty; source: RatingSource }; // some layer already decided
 
 let PENDING: TurnDecision | undefined;
+
+// ---------------------------------------------------------------------------
+// The decision store: where abstain-zone chain verdicts live, so a similar
+// future prompt can reuse them without any model call.
+//
+// Two integer-only representations:
+//   profile  u32 fingerprint (signal classes + one-hot margin band) -
+//            cross-language, tolerant of one signal more or less
+//   sketch   bottom-K FNV-1a hashes of the prompt's trigrams - rewording,
+//            identifiers, CJK (no word segmentation needed)
+//
+// Disk: an append-only JSONL journal next to the extension (removed together
+// with it). Memory: a fixed typed-array ring sized by MEMORY_RING, so RAM is
+// bounded by the cap no matter how long Pi runs; the journal is trimmed to
+// MEMORY_KEEP_LINES lines on load.
+// ---------------------------------------------------------------------------
+
+const MEMORY_FILE = "auto-router-memory.jsonl";
+/** Fixed in-memory footprint: MEMORY_RING * (4 + 128 + 1 + 1) bytes. */
+export const MEMORY_RING = 2_000;
+/** Journal cap; the oldest lines are dropped on load. */
+export const MEMORY_KEEP_LINES = 4_000;
+const SKETCH_SLOTS = 32;
+
+/** Canonical profile classes - a signal's language is not a capability. */
+const PROFILE_CLASSES = [
+	"stack-trace",
+	"concurrency",
+	"architecture",
+	"security",
+	"debug",
+	"performance",
+	"wide-scope",
+	"trivial",
+	"lookup",
+	"small-edit",
+	"big-context",
+	"multi-file",
+	"short",
+	"question",
+] as const;
+
+/** Profile gate uses the overlap coefficient (tolerant to subsets); text uses Jaccard. */
+const SIM_PROFILE_MIN = 0.6;
+const SIM_TEXT_MIN = 0.35;
+/** Reuse needs enough neighbours that mostly agree; otherwise keep abstaining. */
+const MEM_MIN_HITS = 3;
+const MEM_TOP_K = 5;
+const MEM_AGREE = 0.8;
+
+function classBit(signal: string): number {
+	// cn-x and x are one class (language is not a capability); hard-debug is debug.
+	const name = signal.startsWith("cn-") ? signal.slice(3) : signal === "hard-debug" ? "debug" : signal;
+	const index = (PROFILE_CLASSES as readonly string[]).indexOf(name);
+	return index < 0 ? 0 : 1 << index;
+}
+
+function bandOf(pro: number, flash: number): number {
+	const d = pro - flash;
+	if (d <= -3) return 0;
+	if (d <= -1) return 1;
+	if (d <= 1) return 2;
+	if (d <= 3) return 3;
+	return 4;
+}
+
+/** Signal classes in bits 0..15, one-hot margin band in bits 16..20. */
+function makeProfile(signals: readonly string[], pro: number, flash: number): number {
+	let mask = 0;
+	for (const signal of signals) mask |= classBit(signal);
+	return (mask & 0xffff) | (1 << (16 + bandOf(pro, flash)));
+}
+
+function popcount32(value: number): number {
+	let x = value - ((value >>> 1) & 0x55555555);
+	x = (x & 0x33333333) + ((x >>> 2) & 0x33333333);
+	x = (x + (x >>> 4)) & 0x0f0f0f0f;
+	return (x * 0x01010101) >>> 24;
+}
+
+/**
+ * The text key: SKETCH_SLOTS smallest FNV-1a hashes of the prompt's character
+ * trigrams, sorted. Shared trigrams become shared integers, so similarity is
+ * integer comparison - no strings kept, no embeddings, no word segmentation.
+ */
+export function textSketch(prompt: string): Uint32Array {
+	const window = prompt.length > MAX_SCAN_CHARS ? prompt.slice(0, MAX_SCAN_CHARS) : prompt;
+	const text = window.toLowerCase().replace(/\s+/g, " ");
+	const count = text.length - 2;
+	if (count <= 0) return new Uint32Array(0);
+	const hashes = new Uint32Array(count);
+	for (let i = 0; i < count; i++) {
+		let h = 0x811c9dc5;
+		h = Math.imul(h ^ text.charCodeAt(i), 0x01000193) >>> 0;
+		h = Math.imul(h ^ text.charCodeAt(i + 1), 0x01000193) >>> 0;
+		h = Math.imul(h ^ text.charCodeAt(i + 2), 0x01000193) >>> 0;
+		hashes[i] = h;
+	}
+	hashes.sort();
+	const out = new Uint32Array(SKETCH_SLOTS);
+	let written = 0;
+	for (let i = 0; i < count && written < SKETCH_SLOTS; i++) {
+		if (i > 0 && hashes[i] === hashes[i - 1]) continue;
+		out[written++] = hashes[i];
+	}
+	return out.subarray(0, written);
+}
+
+interface MemoryRing {
+	file: string;
+	count: number;
+	head: number;
+	profile: Uint32Array;
+	sketch: Uint32Array;
+	skLen: Uint8Array;
+	label: Uint8Array; // 1 = flash, 2 = pro
+}
+
+function newRing(file: string): MemoryRing {
+	return {
+		file,
+		count: 0,
+		head: 0,
+		profile: new Uint32Array(MEMORY_RING),
+		sketch: new Uint32Array(MEMORY_RING * SKETCH_SLOTS),
+		skLen: new Uint8Array(MEMORY_RING),
+		label: new Uint8Array(MEMORY_RING),
+	};
+}
+
+export function memoryFile(): string {
+	return path.join(configDir(), MEMORY_FILE);
+}
+
+function encodeSketch(sketch: Uint32Array): string {
+	const capped = sketch.subarray(0, SKETCH_SLOTS);
+	const buf = Buffer.allocUnsafe(capped.length * 4);
+	for (let i = 0; i < capped.length; i++) buf.writeUInt32LE(capped[i], i * 4);
+	return buf.toString("base64");
+}
+
+function parseEntry(line: string): { profile: number; sketch: Uint32Array; label: number } | undefined {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(line);
+	} catch {
+		return undefined; // a torn line from a crash is simply skipped
+	}
+	if (typeof parsed !== "object" || parsed === null) return undefined;
+	const { label, cls, band, sk } = parsed as { label?: unknown; cls?: unknown; band?: unknown; sk?: unknown };
+	if (label !== "flash" && label !== "pro") return undefined;
+	let profile = 1 << (16 + (typeof band === "number" && band >= 0 && band <= 4 ? band : 2));
+	if (Array.isArray(cls)) {
+		for (const name of cls) if (typeof name === "string") profile |= classBit(name);
+	}
+	if (typeof sk !== "string") return undefined;
+	const raw = Buffer.from(sk, "base64");
+	if (!raw.length || raw.length % 4 !== 0 || raw.length / 4 > SKETCH_SLOTS) return undefined;
+	const sketch = new Uint32Array(raw.length / 4);
+	for (let i = 0; i < sketch.length; i++) sketch[i] = raw.readUInt32LE(i * 4);
+	return { profile, sketch, label: label === "pro" ? 2 : 1 };
+}
+
+function loadMemory(file: string): MemoryRing | undefined {
+	let text: string;
+	try {
+		text = readFileSync(file, "utf8");
+	} catch {
+		return undefined; // no journal yet: cold start, identical to no store
+	}
+	const lines = text.split("\n");
+	if (lines.length > MEMORY_KEEP_LINES) {
+		try {
+			writeFileSync(file, lines.slice(-MEMORY_KEEP_LINES).join("\n"));
+		} catch {
+			// best effort; the ring below is what queries actually use
+		}
+	}
+	const ring = newRing(file);
+	for (const line of lines) {
+		if (!line) continue;
+		const entry = parseEntry(line);
+		if (!entry) continue;
+		const slot = ring.head % MEMORY_RING;
+		ring.profile[slot] = entry.profile;
+		ring.sketch.set(entry.sketch.subarray(0, SKETCH_SLOTS), slot * SKETCH_SLOTS);
+		ring.skLen[slot] = entry.sketch.length;
+		ring.label[slot] = entry.label;
+		ring.head++;
+		ring.count = Math.min(ring.count + 1, MEMORY_RING);
+	}
+	return ring;
+}
+
+let MEMORY: MemoryRing | undefined;
+
+/** Lazy load: only ever reached from an abstain, so installs that never
+ * abstain (or never route) read nothing. */
+function memory(): MemoryRing {
+	if (!MEMORY) MEMORY = loadMemory(memoryFile()) ?? newRing(memoryFile());
+	return MEMORY;
+}
+
+/** Forces the next query to re-read the journal (session restarts, tests). */
+export function resetMemoryCache(): void {
+	MEMORY = undefined;
+}
+
+/** For /auto-router status and tests: entries currently in the ring. */
+export function memoryEntries(): number {
+	return MEMORY?.count ?? 0;
+}
+
+/** A chain verdict from the abstain zone becomes a stored example. Local
+ * decisions and "keep" (no rater answered) are never stored: they would only
+ * echo the rule that produced them. */
+function rememberDecision(profile: number, sketch: Uint32Array, rated: Difficulty, by: "self" | "jev"): void {
+	const ring = memory();
+	const slot = ring.head % MEMORY_RING;
+	ring.profile[slot] = profile;
+	ring.sketch.set(sketch.subarray(0, SKETCH_SLOTS), slot * SKETCH_SLOTS);
+	ring.skLen[slot] = Math.min(sketch.length, SKETCH_SLOTS);
+	ring.label[slot] = rated === "pro" ? 2 : 1;
+	ring.head++;
+	ring.count = Math.min(ring.count + 1, MEMORY_RING);
+	const cls: string[] = [];
+	for (let i = 0; i < 16; i++) if (profile & (1 << i)) cls.push(PROFILE_CLASSES[i] ?? `bit${i}`);
+	let bandBits = (profile >>> 16) & 0x1f;
+	let band = 0;
+	while (bandBits > 1) {
+		bandBits >>>= 1;
+		band++;
+	}
+	const line = JSON.stringify({
+		t: Math.floor(Date.now() / 1000),
+		cls,
+		band,
+		sk: encodeSketch(sketch),
+		label: rated,
+		by,
+	});
+	try {
+		appendFileSync(ring.file, `${line}\n`);
+	} catch {
+		// best effort: the ring already holds this entry
+	}
+}
+
+export interface MemoryHit {
+	rated: Difficulty;
+	hits: number;
+	agree: number;
+}
+
+/**
+ * Similarity query over the ring: profile overlap OR trigram agreement picks
+ * candidates, a top-k vote decides. Returns undefined unless enough neighbours
+ * agree - similarity only proposes, agreement decides.
+ */
+export function queryMemory(profile: number, sketch: Uint32Array): MemoryHit | undefined {
+	const ring = memory();
+	if (ring.count === 0) return undefined;
+	const queryClasses = profile & 0xffff;
+	if (!queryClasses) return undefined; // nothing to match on (no signals)
+	const candidates: { slot: number; score: number }[] = [];
+	for (let j = 0; j < ring.count; j++) {
+		const slot = (ring.head + MEMORY_RING - ring.count + j) % MEMORY_RING;
+		const stored = ring.profile[slot] & 0xffff;
+		let score = 0;
+		const shared = popcount32(queryClasses & stored);
+		if (shared > 0) {
+			const overlap = shared / Math.min(popcount32(queryClasses), popcount32(stored));
+			if (overlap >= SIM_PROFILE_MIN) score = overlap;
+		}
+		const storedLen = ring.skLen[slot];
+		if (sketch.length > 0 && storedLen > 0) {
+			const need = Math.ceil((SIM_TEXT_MIN * (sketch.length + storedLen)) / (1 + SIM_TEXT_MIN));
+			let a = 0;
+			let b = 0;
+			let s = 0;
+			const base = slot * SKETCH_SLOTS;
+			while (a < sketch.length && b < storedLen) {
+				if (sketch[a] === ring.sketch[base + b]) {
+					s++;
+					a++;
+					b++;
+				} else if (sketch[a] < ring.sketch[base + b]) a++;
+				else b++;
+				if (s + Math.min(sketch.length - a, storedLen - b) < need) break;
+			}
+			if (s >= need) {
+				const textScore = s / (sketch.length + storedLen - s);
+				if (textScore > score) score = textScore;
+			}
+		}
+		if (score > 0) candidates.push({ slot, score });
+	}
+	if (candidates.length < MEM_MIN_HITS) return undefined;
+	candidates.sort((x, y) => y.score - x.score);
+	const top = Math.min(MEM_TOP_K, candidates.length);
+	let pro = 0;
+	for (let i = 0; i < top; i++) if (ring.label[candidates[i].slot] === 2) pro++;
+	const flash = top - pro;
+	const agree = Math.max(pro, flash) / top;
+	if (agree < MEM_AGREE) return undefined;
+	return { rated: pro > flash ? "pro" : "flash", hits: candidates.length, agree };
+}
 
 function routeTo(request: AutoRequest, ctx: ExtensionContext, rated: Difficulty, state?: AutoState): ModelRoute<AutoState> {
 	const role = rated === "pro" ? ROLES.pro : ROLES.flash;
@@ -844,6 +1181,12 @@ async function routeVirtual(request: AutoRequest, ctx: ExtensionContext): Promis
 	});
 	debugRating(`decided ${source}/${rated} in ${Date.now() - started}ms`);
 	if (source === "self" || source === "jev" || source === "keep") stats[source]++;
+	// An abstain-zone verdict becomes a stored example for future prompts;
+	// "keep" is not a rating, so nothing is stored for it.
+	if (PENDING?.source === "chain" && (source === "self" || source === "jev")) {
+		rememberDecision(PENDING.profile, PENDING.sketch, rated, source);
+		debugRating(`stored ${rated} by ${source} (${memoryEntries()} entries)`);
+	}
 	// Remember it for the rest of this run so continuations do not re-rate.
 	PENDING = { rated, source };
 	return routeTo(request, ctx, rated, { rated, source });
@@ -877,6 +1220,9 @@ export default function (pi: ExtensionAPI) {
 				const roles = readRoles();
 				const pair = resolvePair(ctx.modelRegistry);
 				const coverage = stats.prompts ? Math.round((stats.local / stats.prompts) * 100) : 0;
+				const memoryLine = MEMORY
+					? `memory:  ${MEMORY.count} entries, ${stats.memoryReused}/${stats.memoryLookups} lookups reused`
+					: `memory:  not loaded (loads on the first abstain), ${stats.memoryReused}/${stats.memoryLookups} lookups reused`;
 				return [
 					`config:  ${configFile()}${readOwnConfig() ? "" : "  (missing - run /auto-router to create it)"}`,
 					`flash:   ${roles.flash.provider}/${roles.flash.id}`,
@@ -884,6 +1230,7 @@ export default function (pi: ExtensionAPI) {
 					`pair:    ${pair ? "resolved in catalog" : "NOT available"}`,
 					`default: ${readDefaultModel() ?? "(unset)"}`,
 					`local:   ${stats.local}/${stats.prompts} prompts decided locally (${coverage}%), ${stats.abstain} sent to the chain`,
+					memoryLine,
 					`chain:   self ${stats.self}, jev ${stats.jev}, keep ${stats.keep}, direct ${stats.direct}, inherited ${stats.inherited}`,
 				];
 			};
@@ -946,9 +1293,11 @@ export default function (pi: ExtensionAPI) {
 	// availability comes from the registry, and other extensions can register
 	// providers after this one loads.
 	pi.on("session_start", (_event, ctx) => {
-		// A session (or branch) switch starts this session's tally over.
+		// A session (or branch) switch starts this session's tally over and
+		// re-reads the decision journal (another process may have appended).
 		PENDING = undefined;
 		resetStats();
+		resetMemoryCache();
 		const available = Boolean(resolvePair(ctx.modelRegistry));
 		const selected = ctx.model?.provider === VIRTUAL_PROVIDER && ctx.model?.id === VIRTUAL_ID;
 		if (available && !registered) {
@@ -977,15 +1326,27 @@ export default function (pi: ExtensionAPI) {
 		if (ctx.model && (ctx.model.provider !== VIRTUAL_PROVIDER || ctx.model.id !== VIRTUAL_ID)) return;
 		if (!resolvePair(ctx.modelRegistry)) return;
 		stats.prompts++;
-		const local = decideLocally(event.prompt ?? "");
-		if (local) {
+		const analysis = analyzePrompt(event.prompt ?? "");
+		if (analysis.decision) {
 			stats.local++;
-			PENDING = { rated: local.rated, source: "local" };
-			debugRating(`local ${local.rated} conf=${local.confidence.toFixed(2)} via ${local.signals.join("+")}`);
+			PENDING = { rated: analysis.decision.rated, source: "local" };
+			debugRating(
+				`local ${analysis.decision.rated} conf=${analysis.decision.confidence.toFixed(2)} via ${analysis.decision.signals.join("+")}`,
+			);
 			return;
 		}
 		stats.abstain++;
-		PENDING = { source: "chain" };
+		// Abstain: ask the store before spending a model call.
+		const sketch = textSketch(event.prompt ?? "");
+		stats.memoryLookups++;
+		const hit = queryMemory(analysis.profile, sketch);
+		if (hit) {
+			stats.memoryReused++;
+			PENDING = { rated: hit.rated, source: "memory" };
+			debugRating(`memory ${hit.rated} (${hit.hits} neighbours, ${(hit.agree * 100).toFixed(0)}% agree)`);
+			return;
+		}
+		PENDING = { source: "chain", profile: analysis.profile, sketch };
 		debugRating("local abstain; flash rating chain decides");
 	});
 

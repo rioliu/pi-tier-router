@@ -7,6 +7,11 @@ decides flash-vs-pro per prompt, before any model call.
 Goal: per-prompt routing in the agent loop, layered `local -> flash rating -> Jev`, with ≥95%
 of prompts decided by layer 0.
 
+**Status**: phases 0/1 (local signals + flash/Jev chain) and the decision store (phase 2 —
+signal-profile + trigram kNN over chain verdicts) shipped in v0.2.0. The remaining open items
+are the LSH upgrade path (only if the ring cap grows far past 2 000) and offline threshold
+calibration against real journal data.
+
 ---
 
 ## 1. The taxonomy (what the list teaches)

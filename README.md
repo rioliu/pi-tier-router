@@ -28,11 +28,15 @@ prompt arrives (before_agent_start)
   0. local router reads the prompt: 0 ms, no tokens, deterministic
        clear signals  -> decided right away (flash or pro)
        mixed/missing  -> abstain
-  1. on abstain: flash model rates the issue itself (rating + confidence)
+  1. on abstain: the decision store is consulted first
+       a similar past verdict is reused (signal-profile overlap or trigram
+       match, k-NN vote) -> no model call at all
+  2. otherwise: flash model rates the issue itself (rating + confidence)
        confidence >= 0.8  -> decision is final, nothing else is consulted
-  2. unsure  -> ask Jev, but only if JEVMODEL_API_KEY is configured
-  3. no Jev  -> keep the flash model's lean
-  4. neither -> keep the current model (flash for a new session); routing stops
+       and the verdict is stored for future prompts
+  3. unsure  -> ask Jev, but only if JEVMODEL_API_KEY is configured
+  4. no Jev  -> keep the flash model's lean
+  5. neither -> keep the current model (flash for a new session); routing stops
 ```
 
 - **One prompt, one decision** — the next prompt re-decides, so a hard task can escalate without
@@ -41,6 +45,11 @@ prompt arrives (before_agent_start)
   reports how often the local layer decided on its own. Signals cover **English and Chinese**
   (stack traces are language-neutral), and the scan looks at the first 32 KB only — a 1 MB paste
   still decides in ~0.3 ms, and past the window the layer abstains rather than guess.
+- **It remembers**: chain verdicts from the abstain zone are stored next to the extension — a
+  JSONL journal on disk and a fixed typed-array ring in memory (2 000 entries, ~285 KB, never
+  grows with age). Similar prompts reuse them instead of paying for a rating call; neighbours
+  that disagree keep abstaining. The file is removed together with the extension, and deleting
+  it by hand is always safe — the store rebuilds itself.
 - **Jev is optional**, never a dependency — consulted only when the local layer abstains *and* the
   flash model is unsure.
 - **Compaction summaries** always run on the flash model.
@@ -127,12 +136,17 @@ AUTO_ROUTER_DEBUG=1 pi
 [auto-router] local pro conf=0.93 via concurrency
 ```
 
-Local decisions print a single line and cost nothing. Only an abstain reaches the model chain:
+Local decisions print a single line and cost nothing. Only an abstain reaches the store or the
+model chain:
 
 ```
 [auto-router] local abstain; flash rating chain decides
 [auto-router] self rated=pro conf=0.92
 [auto-router] decided self/pro in 1432ms
+[auto-router] stored pro by self (4 entries)
+
+[auto-router] local abstain; flash rating chain decides
+[auto-router] memory flash (3 neighbours, 100% agree)      <- no rating call at all
 ```
 
 The interactive footer shows the routed model (`auto • medium → deepseek-v4-pro`) and `/session` lists cost per physical model.
@@ -152,8 +166,10 @@ npm test        # node >= 23 (native TypeScript stripping)
 ```
 
 The suite covers the local router's signal table, the decision chain, the hook → route() wiring,
-config persistence and refresh, change warnings, and the `provider/model-id` parser. It runs against
-a temporary copy of the extension, so it never writes into your real Pi directory.
+the decision store (round-trip through the journal, torn lines, ring and journal caps, the
+agreement gate), config persistence and refresh, change warnings, and the `provider/model-id`
+parser. It runs against a temporary copy of the extension, so it never writes into your real Pi
+directory.
 
 ## License
 

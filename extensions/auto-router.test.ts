@@ -16,7 +16,7 @@ copyFileSync(REAL, COPY);
 writeFileSync(path.join(root, "settings.json"), JSON.stringify({ defaultProvider: "router", defaultModel: "auto" }));
 process.env.PI_CODING_AGENT_DIR = root;
 
-const { default: factory, chooseRating, decideLocally, stats, parseRole, parseSelfRating, checkConfig, writeOwnConfig } =
+const { default: factory, chooseRating, decideLocally, analyzePrompt, textSketch, queryMemory, resetMemoryCache, memoryEntries, MEMORY_RING, MEMORY_KEEP_LINES, stats, parseRole, parseSelfRating, checkConfig, writeOwnConfig } =
 	await import(pathToFileURL(COPY).href);
 
 // Package installs keep their config next to their own extension file, with an
@@ -391,8 +391,131 @@ async function run() {
 	if (savedJevKey === undefined) delete process.env.JEVMODEL_API_KEY;
 	else process.env.JEVMODEL_API_KEY = savedJevKey;
 
+	// ---- the decision store: chain verdicts become reusable examples ----
+	const MEMORY_PATH = path.join(root, "extensions", "auto-router-memory.jsonl");
+	rmSync(MEMORY_PATH, { force: true });
+	resetMemoryCache();
+	// a registry whose flash model answers the rating chain immediately
+	const ratingReg: any = {
+		find: (provider: string, id: string) =>
+			[
+				{ provider: MIMO, id: "mimo-v2.6-flash" },
+				{ provider: MIMO, id: "mimo-v2.6-pro" },
+			].find((m) => m.provider === provider && m.id === id),
+		hasConfiguredAuth: () => true,
+		complete: async () => ({
+			stopReason: "stop",
+			content: [{ type: "text", text: '{"rating":"pro","confidence":0.95}' }],
+		}),
+	};
+	wireCtx.modelRegistry = ratingReg;
+
+	// profile fingerprint: language-neutral classes + one-hot margin band
+	const en = analyzePrompt("fix the race condition in the queue");
+	const zh = analyzePrompt("队列有竞态条件");
+	assert.ok((en.profile & zh.profile & 0xffff) > 0, "en/zh deadlock prompts share a class bit");
+	const enBand = (en.profile >>> 16) & 0x1f;
+	assert.ok(enBand > 0 && (enBand & (enBand - 1)) === 0, "margin band is one-hot");
+	assert.equal(analyzePrompt("").profile & 0xffff, 0, "no signals -> no classes to match on");
+
+	// text sketch: deterministic, bounded, closer to rewording than to unrelated text
+	const t1 = textSketch("fix the race condition in the worker pool queue");
+	assert.deepEqual(
+		Array.from(t1),
+		Array.from(textSketch("fix the race condition in the worker pool queue")),
+		"sketch is deterministic",
+	);
+	assert.ok(t1.length > 0 && t1.length <= 32, "sketch is bounded to 32 slots");
+	const sharedSlots = (a: Uint32Array, b: Uint32Array) => {
+		let i = 0;
+		let j = 0;
+		let s = 0;
+		while (i < a.length && j < b.length) {
+			if (a[i] === b[j]) {
+				s++;
+				i++;
+				j++;
+			} else if (a[i] < b[j]) i++;
+			else j++;
+		}
+		return s;
+	};
+	const near = textSketch("race condition in the worker pool queue - the fix");
+	const far = textSketch("summarize the quarterly newsletter draft");
+	assert.ok(sharedSlots(t1, near) > sharedSlots(t1, far), "rewording shares more slots than unrelated text");
+
+	// 1) abstain -> chain rates it -> verdict lands in the ring AND the journal
+	const abstainPrompt = "fix the failing test in the queue"; // pro 2 / flash 1: abstain
+	assert.equal(decideLocally(abstainPrompt), undefined, "prompt abstains locally");
+	for (let i = 0; i < 3; i++) {
+		fire("agent_end");
+		fire("before_agent_start", { prompt: abstainPrompt });
+		const run = await routed(userReq(abstainPrompt), wireCtx);
+		assert.equal(modelOf(run), `${MIMO}/mimo-v2.6-pro`, "chain rated pro");
+		assert.equal(run.state.source, "self");
+	}
+	assert.ok(existsSync(MEMORY_PATH), "journal created on the first abstain-zone verdict");
+	const journal = readFileSync(MEMORY_PATH, "utf8").trim().split("\n");
+	assert.equal(journal.length, 3, "one line per stored verdict");
+	assert.equal(JSON.parse(journal[0]).label, "pro");
+	assert.equal(stats.self, 3, "three rating calls, one per verdict");
+
+	// 2) next session: the journal loads and the same prompt hits memory
+	fire("agent_end");
+	resetMemoryCache();
+	const lookupsBefore = stats.memoryLookups;
+	fire("before_agent_start", { prompt: abstainPrompt });
+	assert.equal(stats.memoryLookups, lookupsBefore + 1, "abstain consults the store");
+	assert.equal(stats.memoryReused, 1, "identical prompt reuses the stored verdict");
+	const reused = await routed(userReq(abstainPrompt), wireCtx);
+	assert.equal(modelOf(reused), `${MIMO}/mimo-v2.6-pro`, "memory serves pro");
+	assert.equal(reused.state.source, "memory");
+	assert.equal(stats.self, 3, "no extra rating call - memory decided");
+	assert.ok(memoryEntries() >= 3, "ring loaded from the journal");
+
+	// 3) a torn line is skipped, the store still serves
+	writeFileSync(MEMORY_PATH, '{"t":1727800000,"cls":["debug"', { flag: "a" });
+	fire("agent_end");
+	resetMemoryCache();
+	fire("before_agent_start", { prompt: abstainPrompt });
+	assert.equal(stats.memoryReused, 2, "torn line skipped, store still serves");
+
+	// 4) disagreeing neighbours: similarity proposes, the vote decides -> no reuse
+	const otherPrompt = "refactor the pipeline across all services";
+	const otherAnalysis = analyzePrompt(otherPrompt);
+	const otherSketch = textSketch(otherPrompt);
+	const sketchB64 = (() => {
+		const buf = Buffer.allocUnsafe(otherSketch.length * 4);
+		for (let i = 0; i < otherSketch.length; i++) buf.writeUInt32LE(otherSketch[i], i * 4);
+		return buf.toString("base64");
+	})();
+	const mixed = [
+		...Array.from({ length: 3 }, () => ({ label: "pro" })),
+		...Array.from({ length: 2 }, () => ({ label: "flash" })),
+	].map((entry) =>
+		JSON.stringify({ t: 1727800000, cls: ["architecture", "wide-scope"], band: 2, sk: sketchB64, ...entry }),
+	);
+	writeFileSync(MEMORY_PATH, `${mixed.join("\n")}\n`);
+	fire("agent_end");
+	resetMemoryCache();
+	assert.equal(
+		queryMemory(otherAnalysis.profile, otherSketch),
+		undefined,
+		"3-2 split is below the agreement gate: abstain, never guess",
+	);
+
+	// 5) over-cap journal: the ring stays fixed and the journal is trimmed
+	const goodLine = mixed[0];
+	writeFileSync(MEMORY_PATH, `${Array.from({ length: MEMORY_KEEP_LINES + 1 }, () => goodLine).join("\n")}\n`);
+	fire("agent_end");
+	resetMemoryCache();
+	fire("before_agent_start", { prompt: abstainPrompt }); // triggers the load
+	assert.equal(memoryEntries(), MEMORY_RING, "ring keeps at most MEMORY_RING entries");
+	const trimmed = readFileSync(MEMORY_PATH, "utf8").trim().split("\n");
+	assert.ok(trimmed.length <= MEMORY_KEEP_LINES, `journal trimmed to ${trimmed.length} lines`);
+
 	console.log(
-		"all checkConfig + writeOwnConfig + chooseRating + parseRole + parseSelfRating + decideLocally + hook/route assertions passed",
+		"all checkConfig + writeOwnConfig + chooseRating + parseRole + parseSelfRating + decideLocally + hook/route + memory-store assertions passed",
 	);
 }
 
