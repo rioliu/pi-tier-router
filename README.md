@@ -34,7 +34,8 @@ prompt arrives (before_agent_start)
   2. otherwise: flash model rates the issue itself (rating + confidence)
        confidence >= 0.8  -> decision is final, nothing else is consulted
        and the verdict is stored for future prompts
-  3. unsure  -> ask Jev, but only if JEVMODEL_API_KEY is configured
+  3. unsure  -> ask Jev, but only if a credentialed classifier model is available
+                (TYPESAFE_API_KEY, or any other Jev-capable provider in Pi's registry)
   4. no Jev  -> keep the flash model's lean
   5. neither -> keep the current model (flash for a new session); routing stops
 ```
@@ -160,6 +161,10 @@ Pick any physical model in `/model`, or set your default to the pro model — ro
 ## Requirements
 
 Both role models must be registered in `models.json` with working credentials.
+
+The Jev step is optional: it needs a credentialed **classifier** model in Pi's registry
+(`TYPESAFE_API_KEY` for `typesafe/jev-latest`, or another Jev-capable provider). Without one,
+the chain simply keeps the flash model's lean — routing never depends on Jev.
 
 ## Development
 

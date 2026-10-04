@@ -16,7 +16,7 @@ copyFileSync(REAL, COPY);
 writeFileSync(path.join(root, "settings.json"), JSON.stringify({ defaultProvider: "router", defaultModel: "auto" }));
 process.env.PI_CODING_AGENT_DIR = root;
 
-const { default: factory, chooseRating, decideLocally, analyzePrompt, textSketch, queryMemory, resetMemoryCache, reloadMemory, memoryEntries, MEMORY_RING, MEMORY_KEEP_LINES, stats, parseRole, parseSelfRating, checkConfig, writeOwnConfig } =
+const { default: factory, chooseRating, rateWithJev, decideLocally, analyzePrompt, textSketch, queryMemory, resetMemoryCache, reloadMemory, memoryEntries, MEMORY_RING, MEMORY_KEEP_LINES, stats, parseRole, parseSelfRating, checkConfig, writeOwnConfig } =
 	await import(pathToFileURL(COPY).href);
 
 // Package installs keep their config next to their own extension file, with an
@@ -242,6 +242,97 @@ async function run() {
 	await chooseRating({ keep: "flash", trace: (line: string) => lines.push(line) });
 	assert.deepEqual(lines, ["self unavailable", "jev=unavailable", "no rater available, keeping flash"]);
 
+	// rateWithJev: the chain's Jev step, through Pi's classifier API ----------
+	const liveSignal = new AbortController().signal; // never aborted
+	const jevCtx = (reg: unknown) => ({ modelRegistry: reg }) as any;
+	const classifierReg = (
+		classify: (model: unknown, context: any, options?: any) => Promise<any>,
+		available: unknown[] = [{ provider: "typesafe", id: "jev-latest" }],
+	) => ({
+		getAvailableOfType: async (type: string) => {
+			assert.equal(type, "classifier", "the Jev step resolves a classifier model");
+			return available;
+		},
+		classify,
+	});
+	const choiceResult = (choice: "flash" | "pro", pPro: number) => ({
+		stopReason: "stop",
+		answers: {
+			difficulty: {
+				type: "choice",
+				choice,
+				probabilities: { flash: 1 - pPro, pro: pPro },
+				confidence: Math.max(pPro, 1 - pPro),
+			},
+		},
+	});
+
+	// confident pro over the bar -> pro, and the wire shape stays intact
+	let seen: any;
+	let rj = await rateWithJev(
+		"fix the failing test",
+		jevCtx(classifierReg(async (_m: unknown, context: any) => {
+			seen = context;
+			return choiceResult("pro", 0.9);
+		})),
+		liveSignal,
+	);
+	assert.equal(rj, "pro");
+	assert.equal(seen.state.prompt, "fix the failing test", "prompt travels as classifier state");
+	assert.equal(seen.questions.difficulty.type, "choice", "same typed question as before");
+
+	// a Jev lean below the bar must not escalate
+	rj = await rateWithJev("x", jevCtx(classifierReg(async () => choiceResult("pro", 0.6))), liveSignal);
+	assert.equal(rj, "flash", `P(pro) must beat ${0.8} to escalate`);
+
+	rj = await rateWithJev("x", jevCtx(classifierReg(async () => choiceResult("flash", 0.7))), liveSignal);
+	assert.equal(rj, "flash");
+
+	// no credentialed classifier -> Jev unavailable, classify never reached
+	let classifyCalls = 0;
+	rj = await rateWithJev(
+		"x",
+		jevCtx(classifierReg(async () => {
+			classifyCalls++;
+			return choiceResult("pro", 0.95);
+		}, [])),
+		liveSignal,
+	);
+	assert.equal(rj, undefined);
+	assert.equal(classifyCalls, 0, "no classifier model -> no classify call");
+
+	// provider error -> unavailable, the chain steps to the next rung
+	rj = await rateWithJev(
+		"x",
+		jevCtx(classifierReg(async () => ({ stopReason: "error", errorMessage: "boom" }))),
+		liveSignal,
+	);
+	assert.equal(rj, undefined);
+
+	// our deadline fired (aborted while the caller is live) -> unavailable
+	rj = await rateWithJev(
+		"x",
+		jevCtx(classifierReg(async () => ({ stopReason: "aborted" }))),
+		liveSignal,
+	);
+	assert.equal(rj, undefined);
+
+	// caller cancelled -> propagate; the chain must not swallow cancellation
+	const cancelled = new AbortController();
+	cancelled.abort();
+	await assert.rejects(
+		rateWithJev(
+			"x",
+			jevCtx(classifierReg(async () => ({ stopReason: "aborted" }))),
+			cancelled.signal,
+		),
+		(e: any) => e?.name === "AbortError",
+	);
+
+	// a Pi host without the classifier API steps over Jev entirely
+	rj = await rateWithJev("x", jevCtx({}), liveSignal);
+	assert.equal(rj, undefined);
+
 	// parseSelfRating ---------------------------------------------------------
 	assert.deepEqual(parseSelfRating('{"rating":"pro","confidence":0.9}'), { rated: "pro", confidence: 0.9 });
 	assert.deepEqual(parseSelfRating('Here:\n```json\n{"rating":"flash","confidence":0.7}\n```'), {
@@ -349,8 +440,6 @@ async function run() {
 	});
 	const fire = (event: string, payload?: unknown, ctx: unknown = wireCtx) => handlers.get(event)!(payload, ctx);
 	const modelOf = (r: any) => `${r.model.provider}/${r.model.id}`;
-	const savedJevKey = process.env.JEVMODEL_API_KEY;
-	delete process.env.JEVMODEL_API_KEY;
 
 	fire("session_start", {}); // resets the tally and re-checks config
 	assert.equal(stats.prompts, 0, "session_start resets the tally");
@@ -376,7 +465,7 @@ async function run() {
 	assert.equal(stats.local, 2);
 
 	// ambiguous prompt: local abstains, the chain decides (no rater reachable
-	// here and no Jev key, so the branch keeps its current model)
+	// here and no classifier configured, so the branch keeps its current model)
 	fire("agent_end");
 	fire("before_agent_start", { prompt: "add a button to the header" });
 	assert.equal(stats.abstain, 1, "ambiguous prompt is counted as an abstain");
@@ -384,15 +473,12 @@ async function run() {
 	assert.equal(modelOf(chained), `${MIMO}/mimo-v2.6-flash`, "chain keeps flash with no rater available");
 	assert.equal(chained.state.source, "keep");
 	assert.equal(stats.keep, 1);
-	assert.equal(stats.jev, 0, "Jev stays untouched without its key");
+	assert.equal(stats.jev, 0, "Jev never decides without a credentialed classifier");
 
 	// another model selected: the router does not claim the prompt
 	fire("agent_end");
 	fire("before_agent_start", { prompt: "hi" }, { ...wireCtx, model: { provider: MIMO, id: "mimo-v2.6-flash" } });
 	assert.equal(stats.prompts, 3, "prompts for another model are not counted");
-
-	if (savedJevKey === undefined) delete process.env.JEVMODEL_API_KEY;
-	else process.env.JEVMODEL_API_KEY = savedJevKey;
 
 	// ---- the decision store: chain verdicts become reusable examples ----
 	const MEMORY_PATH = path.join(root, "extensions", "auto-router-memory.jsonl");
