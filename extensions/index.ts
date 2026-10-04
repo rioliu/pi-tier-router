@@ -15,9 +15,10 @@
  *   2. Otherwise the flash model rates the issue and reports a confidence.
  *      At or above the confidence bar the decision is final and Jev is never
  *      contacted - and the verdict is stored so future prompts can reuse it.
- *   3. Only when the flash model is unsure is Jev consulted, and only if
- *      JEVMODEL_API_KEY is configured. Jev is an optional fallback, not a
- *      dependency.
+ *   3. Only when the flash model is unsure is Jev consulted, and only if a
+ *      credentialed classifier model is available (TYPESAFE_API_KEY, or any
+ *      other Jev-capable provider in Pi's registry). Jev is an optional
+ *      fallback, not a dependency.
  *   4. With no Jev available, that lean is kept.
  *   5. If neither rater produced anything (self n/a and Jev n/a), routing
  *      stops: the branch keeps the model it is already on, and a brand-new
@@ -240,7 +241,6 @@ function isRole(model: { provider: string; id: string } | undefined, role: Role)
 const VIRTUAL_PROVIDER = "router";
 const VIRTUAL_ID = "auto";
 
-const JEV_URL = process.env.JEV_URL ?? process.env.JEVMODEL_URL ?? "https://jevmodel.org/v1/systemone";
 /** Hard bound on the self-rating call: a stalled rating must not hold the turn. */
 const SELF_RATING_TIMEOUT_MS = 10_000;
 const RATING_TIMEOUT_MS = 8_000;
@@ -995,24 +995,35 @@ async function rateWithSelf(
 }
 
 /**
- * Ask Jev to rate the issue. Returns undefined on any failure (no key, timeout,
- * unreachable, unexpected answer) so the caller falls back to the next step.
- * A caller-initiated abort is rethrown so cancellation still propagates.
+ * Ask Jev to rate the issue through Pi's classifier API
+ * (ctx.modelRegistry.classify), preferring typesafe/jev-latest and falling
+ * back to the first credentialed classifier. Returns undefined on any
+ * condition - no classifier, our deadline, a provider error, an unexpected
+ * answer - so the caller steps to the next rung of the chain. A
+ * caller-initiated abort is rethrown so cancellation still propagates.
+ * Exported for tests.
  */
-async function rateWithJev(prompt: string, signal: AbortSignal): Promise<Difficulty | undefined> {
-	const key = process.env.JEVMODEL_API_KEY;
-	if (!key) return undefined;
-
+export async function rateWithJev(
+	prompt: string,
+	ctx: ExtensionContext,
+	signal: AbortSignal,
+): Promise<Difficulty | undefined> {
+	const registry = ctx.modelRegistry;
 	const ctrl = new AbortController();
 	const timer = setTimeout(() => ctrl.abort(), RATING_TIMEOUT_MS);
 	const onAbort = () => ctrl.abort();
 	signal.addEventListener("abort", onAbort);
 	try {
-		const res = await fetch(JEV_URL, {
-			method: "POST",
-			headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
-			body: JSON.stringify({
-				model: "jev-latest",
+		// Pi hosts without the classifier API: Jev is optional, so the chain
+		// simply steps over it (the stub registries in tests land here too).
+		if (typeof registry.classify !== "function") return undefined;
+		const available = await registry.getAvailableOfType("classifier");
+		const model =
+			available.find((m) => m.provider === "typesafe" && m.id === "jev-latest") ?? available[0];
+		if (!model) return undefined;
+		const result = await registry.classify(
+			model,
+			{
 				state: { prompt: prompt.slice(0, 12_000) },
 				questions: {
 					difficulty: {
@@ -1027,15 +1038,23 @@ async function rateWithJev(prompt: string, signal: AbortSignal): Promise<Difficu
 						},
 					},
 				},
-			}),
-			signal: ctrl.signal,
-		});
-		if (!res.ok) return undefined;
-		const data = (await res.json()) as {
-			answers?: { difficulty?: { choice?: string; probabilities?: Record<string, number> } };
-		};
-		const answer = data.answers?.difficulty;
-		if (answer?.choice !== "flash" && answer?.choice !== "pro") return undefined;
+			},
+			{ signal: ctrl.signal },
+		);
+		if (result.stopReason === "aborted") {
+			// Our deadline fired -> Jev unavailable; the caller cancelled -> propagate.
+			if (signal.aborted) {
+				const e = new Error("aborted");
+				e.name = "AbortError";
+				throw e;
+			}
+			return undefined;
+		}
+		if (result.stopReason !== "stop") return undefined; // provider error: next rung
+		const answer = result.answers.difficulty;
+		if (answer?.type !== "choice" || (answer.choice !== "flash" && answer.choice !== "pro")) {
+			return undefined;
+		}
 		// A missing probability must not silently coerce to 0 (that would bias
 		// every unknown answer to flash); fall back to the choice itself.
 		const pPro =
@@ -1182,7 +1201,7 @@ async function routeVirtual(request: AutoRequest, ctx: ExtensionContext): Promis
 	const { rated, source } = await chooseRating({
 		keep,
 		self: () => rateWithSelf(prompt, ctx, signal),
-		jev: () => rateWithJev(prompt, signal),
+		jev: () => rateWithJev(prompt, ctx, signal),
 		trace: (line) => debugRating(line),
 	});
 	debugRating(`decided ${source}/${rated} in ${Date.now() - started}ms`);
